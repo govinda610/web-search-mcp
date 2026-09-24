@@ -36,6 +36,11 @@ def remaining(provider: str, monthly_limit) -> int | None:
     return max(0, monthly_limit - used_this_month(provider))
 
 
+def llm_usage() -> dict:
+    """LLM call counts (keys like llm:zai) from this month's ledger."""
+    return {k: v for k, v in _load().items() if k.startswith("llm:")}
+
+
 def status_table(providers: list[dict]) -> str:
     """Human/LLM-readable usage summary across all providers."""
     lines = ["provider     used_this_month   limit       remaining", "-" * 58]

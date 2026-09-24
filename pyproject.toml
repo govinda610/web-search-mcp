@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Self-owned web search/fetch MCP — SearXNG first, cloud providers as fallback/diversity, quota-tracked"
 requires-python = ">=3.12"
 dependencies = [
-    "mcp>=1.9,<2",
+    "mcp>=2,<3",
     "httpx>=0.28",
     "python-dotenv>=1.1",
     "youtube-transcript-api>=1.2.4",

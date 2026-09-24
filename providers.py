@@ -24,7 +24,9 @@ async def search_searxng(query: str, n: int, env: dict, timeout: int, opts=None)
                         headers={"Accept": "application/json"})
         r.raise_for_status()
         return [{"title": x.get("title", ""), "url": x.get("url", ""),
-                 "snippet": (x.get("content") or "")[:300]}
+                 "snippet": (x.get("content") or "")[:300],
+                 **({"img_src": x["img_src"], "thumbnail": x.get("thumbnail_src", "")}
+                    if x.get("img_src") else {})}
                 for x in r.json().get("results", [])[:n]]
 
 
