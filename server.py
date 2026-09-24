@@ -158,6 +158,56 @@ async def suggest(query: str) -> str:
     return "\n".join(str(s) for s in items[:10]) or "No suggestions."
 
 
+def _cache_get(url: str) -> str | None:
+    f = CACHE / (hashlib.md5(url.encode()).hexdigest() + ".txt")
+    if f.exists() and time.time() - f.stat().st_mtime < CONFIG["cache_ttl_minutes"] * 60:
+        return f.read_text()[:20000]
+    return None
+
+
+def _cache_put(url: str, text: str) -> None:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    (CACHE / (hashlib.md5(url.encode()).hexdigest() + ".txt")).write_text(text[:20000])
+
+
+async def _httpx_fetch(url: str) -> str:
+    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True,
+                                 headers={"User-Agent": providers.UA}) as c:
+        r = await c.get(url)
+        if r.status_code in (403, 429, 503) or "Just a moment" in r.text[:2000]:
+            raise providers.ProviderError(f"blocked ({r.status_code})")
+        r.raise_for_status()
+        return r.text
+
+
+async def _curl_cffi_fetch(url: str):
+    """TLS-impersonated fetch; returns None if curl_cffi not installed."""
+    try:
+        from curl_cffi import requests as cffi
+    except ImportError:
+        return None
+    return await asyncio.to_thread(
+        lambda: cffi.get(url, impersonate="chrome", timeout=TIMEOUT,
+                         allow_redirects=True).text)
+
+
+async def _jina_fetch(url: str) -> str:
+    key = ENV.get("JINA_API_KEY")
+    if not key:
+        raise providers.ProviderError("JINA_API_KEY missing")
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.get(f"https://r.jina.ai/{url}",
+                        headers={"Authorization": f"Bearer {key}"})
+        r.raise_for_status()
+        return r.text
+
+
+def _strip_html(html: str) -> str:
+    html = re.sub(r"(?s)<(script|style|nav|footer|header).*?</\1>", " ", html)
+    html = re.sub(r"<[^>]+>", " ", html)
+    return re.sub(r"\s+", " ", html).strip()
+
+
 @mcp.tool()
 async def fetch_page(url: str) -> str:
     """Fetch a web page as clean text. Smart-routes Reddit/YouTube to dedicated fetchers.

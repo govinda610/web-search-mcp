@@ -9,9 +9,11 @@ quota-tracked.
 
 | Tool | What it does |
 |---|---|
-| `web_search(query, num_results, strategy)` | `fallback`: first working provider (SearXNG → DuckDuckGo → Exa → Tavily → Firecrawl → Jina). `merge`: top 3 in parallel, deduped, source-tagged |
-| `fetch_page(url)` | Smart router: Reddit/YouTube auto-delegate; generic pages via direct → curl_cffi (TLS-impersonated) → Jina reader; 1h cache |
-| `reddit_fetch(target, sort, limit)` | Subreddit feeds + posts with comments via Reddit's native RSS (free, no API key) |
+| `web_search(query, num_results, strategy, include_domains, exclude_domains, recency)` | `fallback`: first working provider (SearXNG → DuckDuckGo → Exa → Tavily → Firecrawl → Jina). `merge`: top 3 in parallel, deduped, max 2 per domain, source-tagged. Domain filters are comma-separated substrings; recency: `day\|week\|month\|year` (provider-native) |
+| `news_search(query, num_results, recency)` | Recent news via SearXNG news vertical, Tavily news topic as fallback |
+| `suggest(query)` | Autocomplete suggestions (DuckDuckGo, free, no key) |
+| `fetch_page(url)` | Smart router: Reddit/YouTube auto-delegate; generic pages via direct → curl_cffi (TLS-impersonated) → Jina reader; JS-shell soft-failure escalation; 1h cache |
+| `reddit_fetch(target, sort, limit)` | Subreddit feeds + posts with comments. Arctic Shift archive (primary) → Reddit RSS behind 60s throttle + 5-min cache + Retry-After backoff (no key, ban-safe) |
 | `youtube_transcript(url, lang)` | Captions/auto-generated transcripts (free) |
 | `usage_status()` | This month's usage vs per-provider limits |
 

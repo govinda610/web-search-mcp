@@ -55,6 +55,8 @@ async def _arctic_comments(post_id: str, timeout: int):
     items = data.get("data") if isinstance(data, dict) else data
     lines = []
     for cm in (items or [])[:10]:
+        if isinstance(cm, dict) and isinstance(cm.get("data"), dict):
+            cm = cm["data"]  # arctic returns reddit-listing-style {kind, data} wrappers
         body = (cm.get("body") or "").replace("\n", " ")[:350]
         if body:
             lines.append(f"  > [u/{cm.get('author', '?')}] {body}")
