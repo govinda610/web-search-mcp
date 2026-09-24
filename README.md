@@ -51,6 +51,12 @@ missing. LLM features (`answer`/`highlights`/`auto`) read coding-plan credential
 `~/.pi/agent/models.json` (zai → qwen → minimax chain) — no extra keys needed; if all
 models fail, searches proceed as plain result lists.
 
+## Testing
+
+```bash
+uv run test_stack.py   # 43 checks: transports, all tools, routing, degradation
+```
+
 ## Wiring agents
 
 ```bash
