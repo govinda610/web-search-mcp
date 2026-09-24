@@ -45,6 +45,9 @@ are optional fallbacks, used only when local search fails, and every one is quot
    site's check is solved once. Set `FETCH_VISIBLE_BROWSER=0` to turn this stage off.
 5. **Jina reader**, only if `JINA_API_KEY` is set.
 
+If the connection itself fails (how an ISP block looks: timeouts, resets, DNS failures), the
+whole chain runs again through Tor and the site is remembered as Tor-only for the session.
+
 HTML → markdown with title/author/date metadata via trafilatura; PDF → text via pymupdf.
 Real 404s and unresolvable domains fail immediately instead of escalating. Challenge pages
 are never returned as content. Extracted text is cached for an hour in `state/cache/`.
@@ -91,6 +94,13 @@ Optional keys in `.env`: `EXA_API_KEY`, `TAVILY_API_KEY`, `FIRECRAWL_API_KEY`, `
 Missing keys are skipped. LLM features (`answer`/`highlights`/`auto`) read coding-plan
 credentials from `~/.pi/agent/models.json` (zai → qwen → minimax chain); if none respond,
 searches return plain result lists.
+
+## For agents
+
+The server sends a short "which tool when" guide as MCP instructions. Every parameter has a
+description, fixed choices are enums (`strategy`, `recency`, `depth`, `category`, `sort`,
+`sites`), numbers have ranges, and tools carry read-only / writes-files hints so clients
+can auto-approve the safe ones. Failures come back as a plain sentence saying what went wrong.
 
 ## Transports (MCP SDK v2)
 

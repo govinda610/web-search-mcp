@@ -142,6 +142,8 @@ async def fetch_tests():
     del os.environ["FETCH_VISIBLE_BROWSER"]
     r = await server.fetch_page("https://example.com/definitely-missing-page-404")
     ok("fetch: 404 fails fast", "HTTP 404" in r, r[:60])
+    r = await server.fetch_page("https://www.limetorrents.fun/search/all/dune/", 300)
+    ok("fetch: ISP-blocked site via Tor", "+tor)" in r or "(via cache)" in r, r[:60])
     r = await server.fetch_page("https://youtu.be/dQw4w9WgXcQ")
     ok("fetch: routes youtube", "segments" in r, r[:50])
     r = await server.fetch_page("https://www.reddit.com/r/commandline/comments/1woks8t/")
@@ -238,8 +240,13 @@ async def transport_stdio():
     params = StdioServerParameters(command=sys.executable, args=["server.py"], cwd=os.getcwd())
     async with stdio_client(params) as (rw, ww):
         async with ClientSession(rw, ww) as s:
-            await s.initialize()
-            names = sorted(t.name for t in (await s.list_tools()).tools)
+            init = await s.initialize()
+            ok("transport: server instructions sent", "media_search" in (init.instructions or ""), init.instructions)
+            tools = (await s.list_tools()).tools
+            names = sorted(t.name for t in tools)
+            schema = next(t for t in tools if t.name == "web_search").input_schema["properties"]
+            ok("transport: choices exposed as enums", schema["strategy"].get("enum") == ["fallback", "merge", "exhaustive"]
+               and all("description" in v for v in schema.values()), schema["strategy"])
             ok("transport: stdio 13 tools", len(names) == 13, str(names))
             res = await s.call_tool("usage_status", {})
             ok("transport: stdio call works", "provider" in res.content[0].text)

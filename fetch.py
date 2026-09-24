@@ -3,7 +3,8 @@
 Chain: curl_cffi (Chrome TLS fingerprint) -> Camoufox headless (stealth Firefox, solves
 JS/Cloudflare challenges) -> your own Chrome over the DevTools protocol (only if CHROME_CDP_URL
 is set; logged-in sites) -> Camoufox in a visible window (passes DataDome) -> Jina reader
-(only if JINA_API_KEY is set). HTML -> markdown via trafilatura,
+(only if JINA_API_KEY is set). A site your ISP blocks (the connection itself fails) is retried
+through Tor with the same chain, and remembered as Tor-only. HTML -> markdown via trafilatura,
 PDF -> text via pymupdf. Extracted text is cached on disk for an hour.
 """
 import asyncio
@@ -14,6 +15,7 @@ import re
 import time
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import urlparse
 
 import httpx
 import pymupdf
@@ -37,9 +39,16 @@ CHALLENGE_MARKERS = (
     "please enable js and disable any ad blocker",
     "<title>prove your humanity",                # Reddit bot wall
     "<title>ddos-guard",                         # DDoS-Guard JS check + manual captcha (Anna's Archive)
+    "<title>error 1015",                          # Cloudflare rate limit
+    "<title>sci-hub: are you are robot",         # Sci-Hub captcha
 )
 RETRYABLE = (401, 403, 429, 503)  # statuses a stealthier fetcher may get past
 BROWSER_SLOTS = asyncio.Semaphore(2)  # each Camoufox instance is a full browser
+TOR = os.environ.get("TOR_PROXY", "socks5h://127.0.0.1:9050")
+VIA_TOR: set[str] = set()  # hosts that only answer through Tor, learned this session
+# curl errors that mean the connection was cut before any HTTP happened: an ISP block, not the site.
+UNREACHABLE = ("Could not resolve host", "Connection timed out", "Connection refused",
+               "Connection reset", "Recv failure", "SSL_ERROR_SYSCALL")
 
 
 class FetchError(Exception):
@@ -80,18 +89,20 @@ def to_text(url: str, content_type: str, body: bytes) -> str:
     return body.decode("utf-8", errors="replace")
 
 
-async def _curl_cffi(url: str, timeout: int):
+async def _curl_cffi(url: str, timeout: int, proxy: str | None = None):
     async with AsyncSession() as s:
-        r = await s.get(url, impersonate="chrome", timeout=timeout, allow_redirects=True)
+        r = await s.get(url, impersonate="chrome", timeout=timeout, allow_redirects=True, proxy=proxy)
     return r.status_code, r.headers.get("content-type", ""), r.content
 
 
-async def _camoufox(url: str, timeout: int, headless: bool = True):
+async def _camoufox(url: str, timeout: int, proxy: str | None = None, headless: bool = True):
     from camoufox.async_api import AsyncCamoufox
 
     # The visible window uses the settings verified against DataDome (G2): real-location
     # fingerprint + human-like cursor movement. os is pinned so saved cookies match the fingerprint.
     options = {"os": "macos"} if headless else {"os": "macos", "humanize": True, "geoip": True}
+    if proxy:  # Firefox takes socks5:// and resolves hostnames through the proxy itself
+        options["proxy"] = {"server": proxy.replace("socks5h://", "socks5://")}
     async with BROWSER_SLOTS, AsyncCamoufox(headless=headless, **options) as browser:
         page = await browser.new_page(storage_state=COOKIES if COOKIES.exists() else None)
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 2000)
@@ -114,7 +125,7 @@ async def _camoufox(url: str, timeout: int, headless: bool = True):
     return 200, "text/html", body
 
 
-async def _jina(url: str, timeout: int):
+async def _jina(url: str, timeout: int, proxy: str | None = None):  # Jina fetches from its own servers
     key = os.environ.get("JINA_API_KEY")
     if not key:
         raise FetchError("JINA_API_KEY not set")
@@ -123,21 +134,23 @@ async def _jina(url: str, timeout: int):
     return r.status_code, "text/markdown", r.content
 
 
-async def _camoufox_visible(url: str, timeout: int):
+async def _camoufox_visible(url: str, timeout: int, proxy: str | None = None):
     """DataDome catches headless browsers but not a real window, so a Firefox window opens
     briefly. Only reached when the headless browser was blocked. FETCH_VISIBLE_BROWSER=0 disables."""
     if os.environ.get("FETCH_VISIBLE_BROWSER", "1") == "0":
         raise FetchError("disabled (FETCH_VISIBLE_BROWSER=0)")
-    return await _camoufox(url, timeout, headless=False)
+    return await _camoufox(url, timeout, proxy, headless=False)
 
 
-async def _chrome_cdp(url: str, timeout: int):
+async def _chrome_cdp(url: str, timeout: int, proxy: str | None = None):
     """Open the page in a tab of your own running Chrome, with its logins and cookies, over the
     DevTools protocol. For sites that need an account (Instagram, X, LinkedIn) or reject Firefox.
     Opt-in: start Chrome with --remote-debugging-port=9222 and set CHROME_CDP_URL=http://127.0.0.1:9222."""
     endpoint = os.environ.get("CHROME_CDP_URL")
     if not endpoint:
         raise FetchError("CHROME_CDP_URL not set")
+    if proxy:
+        raise FetchError("skipped: your Chrome can't be routed through Tor per tab")
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
@@ -161,14 +174,33 @@ STAGES = [("curl_cffi", _curl_cffi), ("camoufox", _camoufox), ("chrome_cdp", _ch
 
 
 async def fetch(url: str, timeout: int = 15) -> Page:
+    """Run the stage chain; if the site is unreachable directly, run it again through Tor."""
+    host = urlparse(url).hostname or ""
+    if host in VIA_TOR:
+        return await _escalate(url, timeout, TOR)
+    try:
+        return await _escalate(url, timeout, None)
+    except FetchError as direct:
+        if not str(direct).startswith("unreachable"):
+            raise
+        try:
+            page = await _escalate(url, timeout, TOR)
+        except FetchError as tor:
+            raise FetchError(f"{direct}; via Tor: {tor}") from tor
+    VIA_TOR.add(host)
+    return page._replace(via=page.via + "+tor")
+
+
+async def _escalate(url: str, timeout: int, proxy: str | None) -> Page:
     """Escalate through STAGES until one returns real content. Raises FetchError with every attempt."""
     attempts = []
     for name, stage in STAGES:
         try:
-            status, content_type, body = await stage(url, timeout)
+            status, content_type, body = await stage(url, timeout, proxy)
         except Exception as e:  # noqa: BLE001 - any stage failure escalates to the next
-            if "Could not resolve host" in str(e):
-                raise FetchError(f"{name}: domain does not resolve") from e  # no stage can fix DNS
+            if name == "curl_cffi" and any(m in str(e) for m in UNREACHABLE):
+                # a browser can't get past a cut connection either; skip straight to the Tor retry
+                raise FetchError(f"unreachable ({str(e)[:120]})") from e
             attempts.append(f"{name}: {type(e).__name__}: {e}"[:200])
             continue
         if status >= 400 and status not in RETRYABLE:
