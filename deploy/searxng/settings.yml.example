@@ -1,0 +1,9 @@
+use_default_settings: true
+server:
+  secret_key: "GENERATE_ME_openssl_rand_hex_16"
+  limiter: false   # localhost-only binding; our agents ARE the intended clients
+  image_proxy: false
+search:
+  formats:
+    - html
+    - json

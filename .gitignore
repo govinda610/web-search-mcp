@@ -1,0 +1,7 @@
+.venv/
+.env
+state/
+PLAN.md
+__pycache__/
+*.pyc
+deploy/searxng/settings.yml
