@@ -9,7 +9,7 @@ are optional fallbacks, used only when local search fails, and every one is quot
 
 | Tool | What it does |
 |---|---|
-| `web_search(query, num_results, strategy, include_domains, exclude_domains, recency, answer, highlights, auto)` | `fallback` (local first) / `merge` / `exhaustive` (all providers parallel, deduped). Domain + recency filters. `answer`: LLM synthesis with [n] citations. `highlights`: key-fact bullets. `auto`: LLM picks strategy/recency/news routing |
+| `web_search(query, num_results, strategy, include_domains, exclude_domains, recency, depth, more_queries, answer, highlights, auto)` | `fallback` (local first) / `merge` / `exhaustive` (all providers parallel, deduped). Domain + recency filters. `more_queries`: up to 9 extra phrasings run in parallel, results interleaved and deduped. `depth="advanced"`: reads the top 5 pages and adds their most relevant passages. `answer`: LLM synthesis with [n] citations. `highlights`: key-fact bullets. `auto`: LLM picks strategy/recency/news routing |
 | `news_search(query, num_results, recency)` | Recent news via SearXNG news vertical, Tavily as fallback |
 | `suggest(query)` | Autocomplete suggestions (DuckDuckGo, free) |
 | `image_search(query, num_results)` | Image results via SearXNG image vertical |
@@ -19,24 +19,60 @@ are optional fallbacks, used only when local search fails, and every one is quot
 | `fetch_pages(urls, concurrency, max_chars_each)` | Concurrent multi-page fetch |
 | `reddit_fetch(target, sort, limit)` | Post body + comments via Arctic Shift archive, subreddit feeds via throttled RSS. No key, ban-safe |
 | `youtube_transcript(url, lang)` | Captions/auto-generated transcripts |
-| `usage_status()` | Monthly usage per search provider + LLM call counts |
+| `media_search(query, category, num_results, sites)` | Books, comics, manga/manhwa, anime, movies, TV/K-drama, games. Parallel across sources; returns what the title is and where to get it (magnets with seeders, LibGen/Anna's Archive md5s) |
+| `book_download(md5, save_dir)` | Downloads a book/comic/paper by md5 through LibGen |
+| `usage_status()` | Monthly usage per search provider, LLM call counts, current working mirror per site |
 
 ## How fetching works
 
 1. **curl_cffi** with a Chrome TLS fingerprint (plain HTTP clients get 403s from Wikipedia, Medium, …)
 2. **Camoufox** stealth Firefox, only when step 1 is blocked (401/403/429/503 or a challenge
    page) or gets a JavaScript app shell. Solves Cloudflare's JS challenge.
-3. **Camoufox in a visible window**, only when the headless browser is still blocked.
-   DataDome (e.g. G2) detects headless browsers but lets a real window through, so a
-   Firefox window appears for a few seconds. Set `FETCH_VISIBLE_BROWSER=0` to turn it off.
-4. **Jina reader**, only if `JINA_API_KEY` is set.
+3. **Your own Chrome over the DevTools protocol**, only if `CHROME_CDP_URL` is set. The page
+   opens in a new tab of a Chrome you started, with its logins, then the tab closes. Use it for
+   sites that need an account (Instagram, X, LinkedIn) or reject Firefox. Start Chrome with a
+   dedicated profile (Chrome refuses remote debugging on your default profile), log in once:
+   ```bash
+   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+     --remote-debugging-port=9333 --user-data-dir="$HOME/.web-search-chrome"
+   # .env: CHROME_CDP_URL=http://127.0.0.1:9333
+   ```
+4. **Camoufox in a visible window**, only when everything before it was blocked.
+   DataDome (e.g. G2) detects headless browsers but lets a real window through. If the site
+   shows a check that needs a person (DDoS-Guard's captcha on Anna's Archive, an "I'm not a
+   robot" box), the window waits up to 2 minutes for you to solve it. The cookies it earns are
+   saved to `state/browser-cookies.json` and reused by every later browser fetch, so each
+   site's check is solved once. Set `FETCH_VISIBLE_BROWSER=0` to turn this stage off.
+5. **Jina reader**, only if `JINA_API_KEY` is set.
 
 HTML → markdown with title/author/date metadata via trafilatura; PDF → text via pymupdf.
 Real 404s and unresolvable domains fail immediately instead of escalating. Challenge pages
 are never returned as content. Extracted text is cached for an hour in `state/cache/`.
 
-Known limit: pages behind a login (Instagram, LinkedIn) need a logged-in browser such as
-agent-browser.
+## Media search
+
+| Category | Sources |
+|---|---|
+| books | LibGen, Anna's Archive, Knaben (ebook torrents) |
+| comics | LibGen comics, GetComics, Anna's Archive |
+| manga | AniList, MangaDex, Nyaa, LibGen |
+| anime | AniList, SubsPlease, AnimeTosho, Nyaa, Knaben |
+| movies | YTS, Knaben, The Pirate Bay, Torrents-CSV |
+| tv | TVmaze, Knaben, The Pirate Bay, Torrents-CSV |
+| games | FitGirl only: games run code on your machine, so no random uploaders |
+| torrents | Knaben, The Pirate Bay, Torrents-CSV, Nyaa |
+
+Each source uses the site's lightest endpoint (JSON API, RSS, or its search page): one
+request per search, at most one request per second per host, results cached for an hour.
+Sites your ISP blocks are retried through Tor (`brew install tor && brew services start tor`;
+`TOR_PROXY` overrides the default `socks5h://127.0.0.1:9050`).
+
+**Domains that move.** Shadow libraries and trackers change domains often. `mirrors.py`
+remembers which domain last worked and tries it first. When every known domain fails, it
+refreshes the list (at most every 6 hours) from Prowlarr's indexer definitions (updated
+almost daily) or from [SLUM](https://open-slum.org), the shadow-library uptime monitor. A new
+domain is kept only if the adapter parses real results from it, so parked domains and
+look-alike clones are rejected. State lives in `state/mirrors.json`.
 
 ## Setup
 

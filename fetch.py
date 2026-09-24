@@ -1,7 +1,8 @@
 """Page fetching + local text extraction.
 
 Chain: curl_cffi (Chrome TLS fingerprint) -> Camoufox headless (stealth Firefox, solves
-JS/Cloudflare challenges) -> Camoufox in a visible window (passes DataDome) -> Jina reader
+JS/Cloudflare challenges) -> your own Chrome over the DevTools protocol (only if CHROME_CDP_URL
+is set; logged-in sites) -> Camoufox in a visible window (passes DataDome) -> Jina reader
 (only if JINA_API_KEY is set). HTML -> markdown via trafilatura,
 PDF -> text via pymupdf. Extracted text is cached on disk for an hour.
 """
@@ -20,6 +21,10 @@ import trafilatura
 from curl_cffi import AsyncSession
 
 CACHE = Path(__file__).parent / "state" / "cache"
+# Cookies earned in the visible window (a check you clicked through, a login) are reused by
+# every later browser fetch, so you only solve a site's check once.
+COOKIES = Path(__file__).parent / "state" / "browser-cookies.json"
+HUMAN_WAIT = 120  # seconds the visible window waits for you to finish a manual check
 CACHE_TTL = 3600
 
 # Markers that only appear on bot-challenge interstitials, never on real content pages.
@@ -30,6 +35,8 @@ CHALLENGE_MARKERS = (
     "captcha-delivery.com",                      # DataDome
     "px-captcha",                                # PerimeterX
     "please enable js and disable any ad blocker",
+    "<title>prove your humanity",                # Reddit bot wall
+    "<title>ddos-guard",                         # DDoS-Guard JS check + manual captcha (Anna's Archive)
 )
 RETRYABLE = (401, 403, 429, 503)  # statuses a stealthier fetcher may get past
 BROWSER_SLOTS = asyncio.Semaphore(2)  # each Camoufox instance is a full browser
@@ -83,12 +90,14 @@ async def _camoufox(url: str, timeout: int, headless: bool = True):
     from camoufox.async_api import AsyncCamoufox
 
     # The visible window uses the settings verified against DataDome (G2): real-location
-    # fingerprint + human-like cursor movement.
-    options = {} if headless else {"humanize": True, "geoip": True}
+    # fingerprint + human-like cursor movement. os is pinned so saved cookies match the fingerprint.
+    options = {"os": "macos"} if headless else {"os": "macos", "humanize": True, "geoip": True}
     async with BROWSER_SLOTS, AsyncCamoufox(headless=headless, **options) as browser:
-        page = await browser.new_page()
+        page = await browser.new_page(storage_state=COOKIES if COOKIES.exists() else None)
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 2000)
-        for _ in range(15):  # challenges usually clear within ~5s
+        # Automatic challenges clear within ~5s. A visible window also waits for you to click
+        # through a manual check (DDoS-Guard captcha, "I'm not a robot" box).
+        for _ in range(15 if headless else HUMAN_WAIT):
             if not is_challenge((await page.content()).encode()):
                 break
             await page.wait_for_timeout(1000)
@@ -97,6 +106,9 @@ async def _camoufox(url: str, timeout: int, headless: bool = True):
         except Exception:  # noqa: BLE001 - pages with long-polling never go idle; content is fine
             pass
         body = (await page.content()).encode()
+        if not headless and not is_challenge(body):
+            COOKIES.parent.mkdir(parents=True, exist_ok=True)
+            await page.context.storage_state(path=COOKIES)
     # The navigation status is the challenge's 403 even when it was solved, so report
     # success and let fetch() judge the final content with is_challenge().
     return 200, "text/html", body
@@ -119,7 +131,32 @@ async def _camoufox_visible(url: str, timeout: int):
     return await _camoufox(url, timeout, headless=False)
 
 
-STAGES = [("curl_cffi", _curl_cffi), ("camoufox", _camoufox),
+async def _chrome_cdp(url: str, timeout: int):
+    """Open the page in a tab of your own running Chrome, with its logins and cookies, over the
+    DevTools protocol. For sites that need an account (Instagram, X, LinkedIn) or reject Firefox.
+    Opt-in: start Chrome with --remote-debugging-port=9222 and set CHROME_CDP_URL=http://127.0.0.1:9222."""
+    endpoint = os.environ.get("CHROME_CDP_URL")
+    if not endpoint:
+        raise FetchError("CHROME_CDP_URL not set")
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(endpoint, timeout=5000)
+        page = await browser.contexts[0].new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 2000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:  # noqa: BLE001, S110 - pages with long-polling never go idle; content is fine
+                pass
+            body = (await page.content()).encode()
+        finally:
+            await page.close()  # closes only our tab; browser.close() below just disconnects
+            await browser.close()
+    return 200, "text/html", body
+
+
+STAGES = [("curl_cffi", _curl_cffi), ("camoufox", _camoufox), ("chrome_cdp", _chrome_cdp),
           ("camoufox_visible", _camoufox_visible), ("jina", _jina)]
 
 

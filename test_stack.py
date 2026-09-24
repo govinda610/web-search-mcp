@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
@@ -15,6 +16,8 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 import fetch  # noqa: E402
 import llm  # noqa: E402
+import media  # noqa: E402
+import mirrors  # noqa: E402
 import papers  # noqa: E402
 import providers  # noqa: E402
 import quota  # noqa: E402
@@ -63,11 +66,22 @@ async def unit_tests():
        and fetch.window(long_text, 80, 40) == "x" * 20)
     ok("logic: quota unlimited", quota.remaining("searxng", None) is None)
     ok("logic: quota limit=0 means skip", quota.remaining("exa", 0) == 0)
+    ok("logic: base32 infohash -> hex", media._hex_hash("RX44RBWVDFTWCZOTNEQGU3WMY7IVXTWO")
+       == "8df9c886d519676165d369206a6eccc7d15bcece")
+    ok("logic: challenge detect DDoS-Guard", fetch.is_challenge(b"<html><title>DDoS-Guard</title>"))
+    passages = server._best_passages("---\ntitle: capital of France\n---\nA paragraph about something "
+                                     "else entirely, long enough to count.\n\nParis is the capital of France "
+                                     "and its largest city by far.", "capital of France", limit=60)
+    ok("logic: best passages skip header", passages.startswith("Paris") and "title:" not in passages, passages)
 
 
 async def search_tests():
     r = await server.web_search("valheim 1.0 seeds", 5)
     ok("search: fallback", r.startswith("[searxng]"), r[:50])
+    r = await server.web_search("valheim 1.0 seeds", 3, more_queries=["valheim ashlands boss"])
+    ok("search: parallel queries tagged", "(q: valheim ashlands boss)" in r, r[:60])
+    r = await server.web_search("python asyncio gather", 3, depth="advanced")
+    ok("search: depth=advanced adds passages", "--- page passages ---" in r, r[:60])
     r = await server.web_search("valheim 1.0 seeds", 6, strategy="merge")
     ok("search: merge", len(r) > 100, r[:50])
     r = await server.web_search("quantum computing 2026 results", 8, strategy="exhaustive")
@@ -179,6 +193,40 @@ async def degradation_tests():
     ok("degrade: youtube captionless message", isinstance(r, str), r[:60])
 
 
+async def media_tests():
+    for name, query, category in [("knaben", "dune part two", "movies"), ("piratebay", "dune part two", "movies"),
+                                  ("torrents_csv", "dune part two", ""), ("yts", "dune", ""),
+                                  ("nyaa", "berserk", "anime"), ("subsplease", "one piece", ""),
+                                  ("animetosho", "frieren", ""), ("fitgirl", "elden ring", ""),
+                                  ("libgen", "dune frank herbert", "books"), ("getcomics", "saga", ""),
+                                  ("mangadex", "solo leveling", ""), ("anilist", "frieren", "anime"),
+                                  ("tvmaze", "crash landing on you", "")]:
+        try:
+            res = await getattr(media, name)(query, 3, category)
+            ok(f"media: {name}", res and res[0]["title"], res[0]["title"] if res else "no results")
+        except Exception as e:  # noqa: BLE001
+            ok(f"media: {name}", False, f"{type(e).__name__}: {e}")
+    r = await server.media_search("frieren", "anime", 3)
+    ok("media: search = catalog + magnets", "WHAT IT IS" in r and "magnet:?xt=urn:btih:" in r, r[:60])
+    ok("media: bad category message", "Unknown category" in await server.media_search("x", "bogus"))
+    with tempfile.TemporaryDirectory() as d:
+        r = await server.book_download("92651ea7d95073ba4c8d345285b6bf74", d)  # an 832 kB epub
+        ok("media: book_download saves epub", r.startswith("saved") and ".epub" in r, r[:60])
+    # self-healing: the only known domain is dead and the list is stale -> refresh from Prowlarr
+    saved_path, saved_state = mirrors.STATE, mirrors._state
+    mirrors.STATE, mirrors._state = Path(tempfile.mkdtemp()) / "m.json", {
+        "yts": {"domains": ["https://yts.invalid"], "refreshed": 0}}
+    try:
+        await mirrors.call("yts", [], {"prowlarr": "yts"},
+                           lambda base: media.http(f"{base}/api/v2/list_movies.json?query_term=dune&limit=1"))
+        ok("mirrors: dead domain healed via Prowlarr", not mirrors.status().startswith("  yts: https://yts.invalid"),
+           mirrors.status())
+    except Exception as e:  # noqa: BLE001
+        ok("mirrors: dead domain healed via Prowlarr", False, e)
+    finally:
+        mirrors.STATE, mirrors._state = saved_path, saved_state
+
+
 async def usage_test():
     u = server.usage_status()
     ok("usage: provider table", "provider" in u and "searxng" in u, u[:40])
@@ -192,7 +240,7 @@ async def transport_stdio():
         async with ClientSession(rw, ww) as s:
             await s.initialize()
             names = sorted(t.name for t in (await s.list_tools()).tools)
-            ok("transport: stdio 11 tools", len(names) == 11, str(names))
+            ok("transport: stdio 13 tools", len(names) == 13, str(names))
             res = await s.call_tool("usage_status", {})
             ok("transport: stdio call works", "provider" in res.content[0].text)
 
@@ -220,7 +268,7 @@ async def transport_http():
 async def main():
     _reset()
     for group in (unit_tests, search_tests, paper_tests, fetch_tests, reddit_tests, llm_tests,
-                  degradation_tests, usage_test, transport_stdio, transport_http):
+                  degradation_tests, media_tests, usage_test, transport_stdio, transport_http):
         try:
             await group()
         except Exception as e:  # noqa: BLE001 - one broken group shouldn't hide the others

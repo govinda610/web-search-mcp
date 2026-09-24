@@ -2,7 +2,7 @@
 
 Tools: web_search (fallback/merge/exhaustive, LLM answer/highlights/auto), news_search,
 suggest, image_search, paper_search, paper_fetch, fetch_page (smart router), fetch_pages,
-reddit_fetch, youtube_transcript, usage_status.
+reddit_fetch, youtube_transcript, media_search, book_download, usage_status.
 Run: uv run server.py (stdio) | MCP_TRANSPORT=http uv run server.py (shared HTTP instance)
 """
 import asyncio
@@ -18,6 +18,8 @@ from mcp.server.mcpserver import MCPServer
 
 import fetch
 import llm
+import media
+import mirrors
 import papers
 import providers
 import quota
@@ -114,7 +116,7 @@ async def _enrich(query, items, want_answer, want_highlights) -> str:
     Token budgets are generous because these are reasoning models: thinking eats the budget first."""
     if not ((want_answer or want_highlights) and items and llm.llm_available()):
         return ""
-    ctx = "\n".join(f"[{i + 1}] {r['title']} | {r['url']} | {r['snippet'][:220]}"
+    ctx = "\n".join(f"[{i + 1}] {r['title']} | {r['url']} | {r.get('content') or r['snippet'][:220]}"
                     for i, r in enumerate(items[:12]))
     answer_prompt = f"Answer using ONLY the numbered results; cite as [n]. Query: {query}\n\n{ctx}"
     highlights_prompt = f"5 key facts with [n] citations. Query: {query}\n\n{ctx}"
@@ -129,30 +131,13 @@ async def _enrich(query, items, want_answer, want_highlights) -> str:
     return out
 
 
-@mcp.tool()
-async def web_search(query: str, num_results: int = 8, strategy: str = "fallback",
-                     include_domains: str = "", exclude_domains: str = "",
-                     recency: str = "", answer: bool = False,
-                     highlights: bool = False, auto: bool = False) -> str:
-    """Search the web.
-    strategy: fallback (first working provider, local SearXNG first) | merge (config.json
-    merge_providers in parallel) | exhaustive (ALL providers parallel, deduped, max 2/domain).
-    include/exclude_domains: comma-separated domains, subdomains included (e.g. "reddit.com,arxiv.org").
-    recency: day|week|month|year (providers without date filters are skipped).
-    answer: LLM synthesis with [n] citations. highlights: LLM key-fact bullets.
-    auto: LLM classifies query and picks strategy/recency/news routing.
-    LLM features use coding-plan models and degrade gracefully to plain results."""
-    if auto and llm.llm_available():
-        spec = await _auto_classify(query)
-        strategy = spec.get("strategy") or strategy
-        recency = spec.get("recency") or recency
-        if spec.get("news"):
-            return await news_search(query, num_results, recency or "week")
+async def _search(query, num_results, strategy, include_domains, exclude_domains, recency):
+    """One query through the providers. Returns (items, errors)."""
     avail = _available_search_providers()
     if recency in _RECENCY_DAYS:
         avail = [p for p in avail if p["name"] in _RECENCY_PROVIDERS]
     if not avail:
-        return "No search providers available (quota exhausted or none enabled)."
+        return [], ["No search providers available (quota exhausted or none enabled)."]
 
     items, errors = [], []
     if strategy in ("merge", "exhaustive"):
@@ -167,7 +152,7 @@ async def web_search(query: str, num_results: int = 8, strategy: str = "fallback
                 errors.append(str(res))
                 continue
             for r in res:
-                key = re.sub(r"[?#].*$", "", r["url"].rstrip("/")).lower()
+                key = _url_key(r["url"])
                 dom = urlparse(r["url"]).netloc
                 # the per-domain cap is for diversity; skip it when the caller asked for specific domains
                 if key in seen or (per_domain.get(dom, 0) >= 2 and not include_domains) \
@@ -189,11 +174,92 @@ async def web_search(query: str, num_results: int = 8, strategy: str = "fallback
             if items:
                 break
             errors.append(f"{p['name']}: 0 results after filtering")
+    return items[:num_results], errors
+
+
+def _url_key(url: str) -> str:
+    return re.sub(r"[?#].*$", "", url.rstrip("/")).lower()
+
+
+def _best_passages(text: str, query: str, limit: int = 1500) -> str:
+    """The paragraphs sharing the most words with the query, kept in document order."""
+    text = re.sub(r"(?s)\A---\n.*?\n---\n", "", text)  # trafilatura's metadata header
+    words = {w for w in re.findall(r"\w+", query.lower()) if len(w) > 2}
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if len(p.strip()) > 40]
+    scored = sorted(range(len(paragraphs)), reverse=True,
+                    key=lambda i: len(words & set(re.findall(r"\w+", paragraphs[i].lower()))))
+    picked, total = [], 0
+    for i in scored:
+        if total + len(paragraphs[i]) > limit and picked:
+            break
+        picked.append(i)
+        total += len(paragraphs[i])
+    return "\n\n".join(paragraphs[i] for i in sorted(picked))[:limit]
+
+
+async def _add_page_content(query: str, items: list[dict], top: int = 5) -> None:
+    """depth=advanced: fetch the top pages in parallel and attach their most relevant passages."""
+    async def one(r):
+        try:
+            kind = sources.classify(r["url"])
+            if kind == "reddit":  # never scrape reddit directly: bans the IP
+                text = await sources.reddit_fetch(r["url"])
+            elif kind == "youtube":
+                text = await sources.youtube_transcript(r["url"])
+            else:
+                _, text = await fetch.fetch_text(r["url"], TIMEOUT)
+            r["content"] = _best_passages(text, query)
+        except Exception as e:  # noqa: BLE001 - a failed page keeps its search snippet
+            r["content"] = ""
+            r["fetch_error"] = str(e)[:120]
+    await asyncio.gather(*(one(r) for r in items[:top]))
+
+
+@mcp.tool()
+async def web_search(query: str, num_results: int = 8, strategy: str = "fallback",
+                     include_domains: str = "", exclude_domains: str = "",
+                     recency: str = "", depth: str = "basic", more_queries: list[str] | None = None,
+                     answer: bool = False, highlights: bool = False, auto: bool = False) -> str:
+    """Search the web.
+    strategy: fallback (first working provider, local SearXNG first) | merge (config.json
+    merge_providers in parallel) | exhaustive (ALL providers parallel, deduped, max 2/domain).
+    include/exclude_domains: comma-separated domains, subdomains included (e.g. "reddit.com,arxiv.org").
+    recency: day|week|month|year (providers without date filters are skipped).
+    depth: basic (titles + snippets) | advanced (also fetches the top 5 pages and returns
+    their most relevant passages; slower, far more content).
+    more_queries: extra phrasings or sub-questions, searched in parallel with query and merged.
+    answer: LLM synthesis with [n] citations. highlights: LLM key-fact bullets.
+    auto: LLM classifies query and picks strategy/recency/news routing.
+    LLM features use coding-plan models and degrade gracefully to plain results."""
+    if auto and llm.llm_available():
+        spec = await _auto_classify(query)
+        strategy = spec.get("strategy") or strategy
+        recency = spec.get("recency") or recency
+        if spec.get("news"):
+            return await news_search(query, num_results, recency or "week")
+    queries = [query] + [q for q in (more_queries or []) if q.strip()][:9]
+    runs = await asyncio.gather(*(_search(q, num_results, strategy, include_domains,
+                                          exclude_domains, recency) for q in queries))
+    # Interleave so every query's best hits make the cut, not just the first query's.
+    items, errors, seen = [], [], set()
+    for rank in range(num_results):
+        for q, (found, _) in zip(queries, runs):
+            if rank < len(found) and _url_key(found[rank]["url"]) not in seen:
+                seen.add(_url_key(found[rank]["url"]))
+                items.append({**found[rank], "query": q})
+    for q, (_, errs) in zip(queries, runs):
+        errors += [f"{q}: {e}" if len(queries) > 1 else e for e in errs]
     if not items:
         return f"All providers failed for: {query}\n" + "\n".join(errors)
-    items = items[:num_results]
+    items = items[:num_results * min(len(queries), 3)]
+    if depth == "advanced":
+        await _add_page_content(query, items)
     out = await _enrich(query, items, answer, highlights)
-    out += "\n".join(f"[{r['via']}] {r['title']}\n  {r['url']}\n  {r['snippet']}" for r in items)
+    for r in items:
+        tag = f"[{r['via']}]" + (f" (q: {r['query']})" if len(queries) > 1 else "")
+        out += f"{tag} {r['title']}\n  {r['url']}\n  {r['snippet']}\n"
+        if r.get("content"):
+            out += "  --- page passages ---\n  " + r["content"].replace("\n", "\n  ") + "\n"
     return out
 
 
@@ -348,6 +414,33 @@ async def youtube_transcript(url: str, lang: str = "en") -> str:
 
 
 @mcp.tool()
+async def media_search(query: str, category: str = "all", num_results: int = 10, sites: str = "") -> str:
+    """Find books, comics, manga/manhwa, anime, movies, TV/K-drama and games across many
+    sources in parallel. category: books | comics | manga | anime | movies | tv | games |
+    torrents | all. sites: optional comma list to restrict (e.g. "libgen,annas_archive").
+    Returns what the title is (AniList, MangaDex, TVmaze) and where to get it: torrents with
+    magnet + seeders (Knaben, The Pirate Bay, Torrents-CSV, YTS, Nyaa, SubsPlease, AnimeTosho,
+    FitGirl) and files with md5 (LibGen, Anna's Archive) or pages (GetComics).
+    Download a book/comic by md5 with book_download."""
+    if category not in media.SOURCES:
+        return f"Unknown category {category!r}. Use one of: {', '.join(media.SOURCES)}"
+    only = [s.strip() for s in sites.split(",") if s.strip()] or None
+    catalog, found, notes = await media.search(query, category, num_results, only)
+    if not catalog and not found:
+        return f"Nothing found. sources: {', '.join(notes)}"
+    return media.format_results(catalog, found, notes, num_results)
+
+
+@mcp.tool()
+async def book_download(md5: str, save_dir: str = "~/Downloads/books") -> str:
+    """Download a book, comic or paper by the md5 that media_search shows (LibGen/Anna's Archive)."""
+    try:
+        return await media.book_download(md5.strip().lower(), save_dir)
+    except Exception as e:  # noqa: BLE001
+        return f"Download failed for {md5}: {e}"
+
+
+@mcp.tool()
 def usage_status() -> str:
     """Show this month's usage vs limits for every search provider + LLM call counts."""
     out = quota.status_table(CONFIG["search_providers"])
@@ -355,6 +448,9 @@ def usage_status() -> str:
     if llm_used:
         out += "\n\nLLM calls this month (coding-plan models):\n" + "\n".join(
             f"  {k}: {v}" for k, v in sorted(llm_used.items()))
+    mirror_state = mirrors.status()
+    if mirror_state:
+        out += "\n\nMirrors (working domain first):\n" + mirror_state
     return out
 
 
