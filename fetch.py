@@ -1,7 +1,8 @@
 """Page fetching + local text extraction.
 
-Chain: curl_cffi (Chrome TLS fingerprint) -> Camoufox (stealth Firefox, solves JS/Cloudflare
-challenges) -> Jina reader (only if JINA_API_KEY is set). HTML -> markdown via trafilatura,
+Chain: curl_cffi (Chrome TLS fingerprint) -> Camoufox headless (stealth Firefox, solves
+JS/Cloudflare challenges) -> Camoufox in a visible window (passes DataDome) -> Jina reader
+(only if JINA_API_KEY is set). HTML -> markdown via trafilatura,
 PDF -> text via pymupdf. Extracted text is cached on disk for an hour.
 """
 import asyncio
@@ -78,10 +79,13 @@ async def _curl_cffi(url: str, timeout: int):
     return r.status_code, r.headers.get("content-type", ""), r.content
 
 
-async def _camoufox(url: str, timeout: int):
+async def _camoufox(url: str, timeout: int, headless: bool = True):
     from camoufox.async_api import AsyncCamoufox
 
-    async with BROWSER_SLOTS, AsyncCamoufox(headless=True) as browser:
+    # The visible window uses the settings verified against DataDome (G2): real-location
+    # fingerprint + human-like cursor movement.
+    options = {} if headless else {"humanize": True, "geoip": True}
+    async with BROWSER_SLOTS, AsyncCamoufox(headless=headless, **options) as browser:
         page = await browser.new_page()
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 2000)
         for _ in range(15):  # challenges usually clear within ~5s
@@ -107,7 +111,16 @@ async def _jina(url: str, timeout: int):
     return r.status_code, "text/markdown", r.content
 
 
-STAGES = [("curl_cffi", _curl_cffi), ("camoufox", _camoufox), ("jina", _jina)]
+async def _camoufox_visible(url: str, timeout: int):
+    """DataDome catches headless browsers but not a real window, so a Firefox window opens
+    briefly. Only reached when the headless browser was blocked. FETCH_VISIBLE_BROWSER=0 disables."""
+    if os.environ.get("FETCH_VISIBLE_BROWSER", "1") == "0":
+        raise FetchError("disabled (FETCH_VISIBLE_BROWSER=0)")
+    return await _camoufox(url, timeout, headless=False)
+
+
+STAGES = [("curl_cffi", _curl_cffi), ("camoufox", _camoufox),
+          ("camoufox_visible", _camoufox_visible), ("jina", _jina)]
 
 
 async def fetch(url: str, timeout: int = 15) -> Page:

@@ -26,14 +26,17 @@ are optional fallbacks, used only when local search fails, and every one is quot
 1. **curl_cffi** with a Chrome TLS fingerprint (plain HTTP clients get 403s from Wikipedia, Medium, …)
 2. **Camoufox** stealth Firefox, only when step 1 is blocked (401/403/429/503 or a challenge
    page) or gets a JavaScript app shell. Solves Cloudflare's JS challenge.
-3. **Jina reader**, only if `JINA_API_KEY` is set.
+3. **Camoufox in a visible window**, only when the headless browser is still blocked.
+   DataDome (e.g. G2) detects headless browsers but lets a real window through, so a
+   Firefox window appears for a few seconds. Set `FETCH_VISIBLE_BROWSER=0` to turn it off.
+4. **Jina reader**, only if `JINA_API_KEY` is set.
 
 HTML → markdown with title/author/date metadata via trafilatura; PDF → text via pymupdf.
 Real 404s and unresolvable domains fail immediately instead of escalating. Challenge pages
 are never returned as content. Extracted text is cached for an hour in `state/cache/`.
 
-Known limit: DataDome-protected sites (e.g. G2) still block. Pages behind a login
-(Instagram, LinkedIn) need a logged-in browser such as agent-browser.
+Known limit: pages behind a login (Instagram, LinkedIn) need a logged-in browser such as
+agent-browser.
 
 ## Setup
 

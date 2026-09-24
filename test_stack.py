@@ -117,6 +117,15 @@ async def fetch_tests():
     ok("fetch: HTML -> markdown w/ metadata", "title:" in r[:400] and "Jump to content" not in r, r[:80])
     r = await server.fetch_page("https://www.nowsecure.nl")
     ok("fetch: anti-bot page passes", r.startswith("(via") and "Fetch failed" not in r, r[:60])
+    status, _, body = await fetch._camoufox_visible("https://example.com", 15)
+    ok("fetch: visible browser stage", status == 200 and b"Example Domain" in body, len(body))
+    os.environ["FETCH_VISIBLE_BROWSER"] = "0"
+    try:
+        await fetch._camoufox_visible("https://example.com", 15)
+        ok("fetch: visible browser can be disabled", False, "stage ran while disabled")
+    except fetch.FetchError as e:
+        ok("fetch: visible browser can be disabled", "disabled" in str(e), e)
+    del os.environ["FETCH_VISIBLE_BROWSER"]
     r = await server.fetch_page("https://example.com/definitely-missing-page-404")
     ok("fetch: 404 fails fast", "HTTP 404" in r, r[:60])
     r = await server.fetch_page("https://youtu.be/dQw4w9WgXcQ")
