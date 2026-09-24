@@ -1,5 +1,4 @@
 """Search provider adapters. Each returns list[{title,url,snippet}] or raises ProviderError."""
-import asyncio
 import re
 import urllib.parse
 
@@ -23,17 +22,22 @@ async def search_searxng(query: str, n: int, env: dict, timeout: int, opts=None)
         r = await c.get(f"{base}/search", params=params,
                         headers={"Accept": "application/json"})
         r.raise_for_status()
-        return [{"title": x.get("title", ""), "url": x.get("url", ""),
-                 "snippet": (x.get("content") or "")[:300],
-                 **({"img_src": x["img_src"], "thumbnail": x.get("thumbnail_src", "")}
-                    if x.get("img_src") else {})}
-                for x in r.json().get("results", [])[:n]]
+    data = r.json()
+    if not data.get("results") and data.get("unresponsive_engines"):
+        down = ", ".join(f"{e} ({why})" for e, why in data["unresponsive_engines"])
+        raise ProviderError(f"searxng: no results, upstream engines down: {down}")
+    return [{"title": x.get("title", ""), "url": x.get("url", ""),
+             "snippet": (x.get("content") or "")[:300],
+             **({"img_src": x["img_src"], "thumbnail": x.get("thumbnail_src", "")}
+                if x.get("img_src") else {})}
+            for x in data.get("results", [])[:n]]
 
 
 async def search_duckduckgo(query: str, n: int, env: dict, timeout: int, opts=None) -> list[dict]:
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
                                  headers={"User-Agent": UA}) as c:
-        r = await c.post("https://html.duckduckgo.com/html/", data={"q": query})
+        r = await c.post("https://html.duckduckgo.com/html/",
+                         data={"q": query, **{k: v for k, v in (opts or {}).items() if k == "df"}})
         r.raise_for_status()
     anchors = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r.text, re.S)
     snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', r.text, re.S)

@@ -1,18 +1,12 @@
 {
   "search_providers": [
-    {"name": "searxng",    "enabled": true,  "monthly_limit": null, "note": "self-hosted, unlimited"},
-    {"name": "duckduckgo", "enabled": true,  "monthly_limit": null, "note": "keyless html endpoint"},
-    {"name": "exa",        "enabled": true,  "monthly_limit": 1000, "note": "quality results"},
-    {"name": "tavily",     "enabled": true,  "monthly_limit": 1000, "note": "resets 1st monthly"},
-    {"name": "firecrawl",  "enabled": true,  "monthly_limit": 1000, "note": "credits, renew 23rd"},
-    {"name": "jina",       "enabled": true,  "monthly_limit": null, "note": "generous free tier"},
-    {"name": "serpdive",   "enabled": false, "monthly_limit": null, "note": "krill=unlimited; adapter pending"},
-    {"name": "querit",     "enabled": false, "monthly_limit": null, "note": "adapter pending"},
-    {"name": "tinyfish",   "enabled": false, "monthly_limit": null, "note": "adapter pending"},
-    {"name": "gemini",     "enabled": false, "monthly_limit": null, "note": "answer-style; adapter pending"}
+    {"name": "searxng",    "enabled": true, "monthly_limit": null, "note": "self-hosted, unlimited"},
+    {"name": "duckduckgo", "enabled": true, "monthly_limit": null, "note": "keyless html endpoint"},
+    {"name": "exa",        "enabled": true, "monthly_limit": 1000, "note": "quality results"},
+    {"name": "tavily",     "enabled": true, "monthly_limit": 1000, "note": "resets 1st monthly"},
+    {"name": "firecrawl",  "enabled": true, "monthly_limit": 1000, "note": "credits, renew 23rd"},
+    {"name": "jina",       "enabled": true, "monthly_limit": null, "note": "generous free tier"}
   ],
   "merge_providers": ["searxng", "exa", "tavily"],
-  "fetch_chain": ["httpx", "curl_cffi", "jina"],
-  "cache_ttl_minutes": 60,
   "request_timeout_seconds": 15
 }

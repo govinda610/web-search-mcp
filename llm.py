@@ -2,7 +2,6 @@
 
 Provider chain: zai glm-5.3-flash -> qwen qwen3.8-flash -> minimax MiniMax-M2.7.
 All anthropic-messages compatible. Quota-tracked as llm:<name>."""
-import asyncio
 import json
 import os
 from pathlib import Path

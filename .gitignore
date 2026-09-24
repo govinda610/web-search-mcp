@@ -7,3 +7,4 @@ __pycache__/
 deploy/searxng/settings.yml
 FIX_PROMPT.md
 *_PROMPT.md
+*.bak

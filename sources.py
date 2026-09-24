@@ -1,13 +1,13 @@
 """Source-specific fetchers: Reddit (public .json), YouTube transcripts. Plus URL routing."""
 import asyncio
-import os
 import random
 import re
 import time
+from urllib.parse import urlparse
 
 import httpx
 
-from providers import ProviderError, UA
+from providers import ProviderError
 
 # Reddit anti-ban: RSS ~1 req/min unauthenticated. Descriptive UA, throttle, cache, backoff.
 _REDDIT_UA = "macos:web-search-mcp:0.1.0 (by /u/govinda610)"
@@ -45,37 +45,48 @@ async def _throttled_reddit_get(url: str, timeout: int) -> str:
         return r.text
 
 
-async def _arctic_comments(post_id: str, timeout: int):
-    """Free no-auth Reddit archive (Arctic Shift). Formatted comments or None."""
+async def _arctic_post(post_id: str, timeout: int):
+    """Post title/body + top comments from the Arctic Shift archive (free, no auth), or None."""
     async with httpx.AsyncClient(timeout=timeout) as c:
-        r = await c.get(f"{ARCTIC}/comments/tree",
-                        params={"link_id": post_id, "limit": 12})
-        r.raise_for_status()
-        data = r.json()
-    items = data.get("data") if isinstance(data, dict) else data
-    lines = []
-    for cm in (items or [])[:10]:
+        post_r, comments_r = await asyncio.gather(
+            c.get(f"{ARCTIC}/posts/ids", params={"ids": post_id}),
+            c.get(f"{ARCTIC}/comments/tree", params={"link_id": post_id, "limit": 12}))
+    post_r.raise_for_status()
+    comments_r.raise_for_status()
+    posts = post_r.json().get("data") or []
+    if not posts:
+        return None
+    post = posts[0]
+    lines = [f"POST: {post.get('title', '')} (r/{post.get('subreddit', '?')}, "
+             f"u/{post.get('author', '?')}, score {post.get('score', '?')})"]
+    if post.get("selftext"):
+        lines.append(post["selftext"][:3000])
+    lines.append("COMMENTS:")
+    for cm in (comments_r.json().get("data") or [])[:10]:
         if isinstance(cm, dict) and isinstance(cm.get("data"), dict):
             cm = cm["data"]  # arctic returns reddit-listing-style {kind, data} wrappers
         body = (cm.get("body") or "").replace("\n", " ")[:350]
         if body:
             lines.append(f"  > [u/{cm.get('author', '?')}] {body}")
-    return "\n".join(lines) if lines else None
+    return "\n".join(lines)
 
 
-REDDIT_HOSTS = ("reddit.com", "old.reddit.com", "redd.it", "np.reddit.com")
-YT_HOSTS = ("youtube.com", "youtu.be", "m.youtube.com", "www.youtube.com")
+REDDIT_HOSTS = ("reddit.com", "redd.it")
+YT_HOSTS = ("youtube.com", "youtu.be")
+
+
+def _host_in(host: str, domains) -> bool:
+    return any(host == d or host.endswith("." + d) for d in domains)
 
 
 def classify(url: str) -> str:
     """Route a URL to a source handler: reddit | youtube | instagram | generic."""
-    host = re.sub(r"^https?://(www\.)?", "", url.split("/")[0] + "." + url.split("/")[2]
-                  if "://" in url else url).split("/")[0].lower()
-    if any(h in host for h in REDDIT_HOSTS):
+    host = (urlparse(url).hostname or "").lower()
+    if _host_in(host, REDDIT_HOSTS):
         return "reddit"
-    if any(h in host for h in YT_HOSTS):
+    if _host_in(host, YT_HOSTS):
         return "youtube"
-    if "instagram.com" in host:
+    if _host_in(host, ("instagram.com",)):
         return "instagram"
     return "generic"
 
@@ -113,7 +124,7 @@ def _format_post_rss(text: str, target: str) -> str:
             body = clean(content.group(1))
             if body:
                 out.append(f"  > {body[:350]}")
-    return chr(10).join(out[:15]) if out else f"No content for {target}"
+    return "\n".join(out[:15]) if out else f"No content for {target}"
 
 
 async def reddit_fetch(target: str, sort: str = "hot", limit: int = 15,
@@ -123,9 +134,9 @@ async def reddit_fetch(target: str, sort: str = "hot", limit: int = 15,
         m = re.search(r"/comments/([a-z0-9]+)", target)
         if m:
             try:
-                comments = await _arctic_comments(m.group(1), timeout)
-                if comments:
-                    return "(via arctic-shift archive)\n" + comments
+                post = await _arctic_post(m.group(1), timeout)
+                if post:
+                    return "(via arctic-shift archive)\n" + post
             except Exception:
                 pass  # archive lags live reddit; fall through to RSS
         url = target.rstrip("/")
@@ -138,7 +149,7 @@ async def reddit_fetch(target: str, sort: str = "hot", limit: int = 15,
 
 def _yt_id(url: str) -> str:
     m = (re.search(r"[?&]v=([\w-]{11})", url) or re.search(r"youtu\.be/([\w-]{11})", url)
-         or re.search(r"shorts/([\w-]{11})", url))
+         or re.search(r"/(?:shorts|live|embed)/([\w-]{11})", url))
     if not m:
         raise ProviderError("no YouTube video id found in URL")
     return m.group(1)

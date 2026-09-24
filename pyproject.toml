@@ -9,6 +9,9 @@ dependencies = [
     "python-dotenv>=1.1",
     "youtube-transcript-api>=1.2.4",
     "curl-cffi>=0.16.3",
+    "trafilatura>=2.2.0",
+    "pymupdf>=1.28.2",
+    "camoufox[geoip]>=0.5.6",
 ]
 
 [tool.uv]

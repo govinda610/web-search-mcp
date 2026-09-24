@@ -7,3 +7,14 @@ search:
   formats:
     - html
     - json
+engines:
+  # Defaults leave only DuckDuckGo/Brave active for general search; more upstreams = no single point of failure.
+  - name: google
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: yahoo
+    disabled: false
+  - name: mojeek
+    disabled: false
+    inactive: false
