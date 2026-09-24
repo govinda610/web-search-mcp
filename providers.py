@@ -12,12 +12,15 @@ class ProviderError(Exception):
     pass
 
 
-async def search_searxng(query: str, n: int, env: dict, timeout: int) -> list[dict]:
+async def search_searxng(query: str, n: int, env: dict, timeout: int, opts=None) -> list[dict]:
     base = env.get("SEARXNG_URL", "").rstrip("/")
     if not base:
         raise ProviderError("SEARXNG_URL not configured")
+    params = {"q": query, "format": "json"}
+    if opts:
+        params.update({k: v for k, v in opts.items() if k in ("time_range", "categories")})
     async with httpx.AsyncClient(timeout=timeout) as c:
-        r = await c.get(f"{base}/search", params={"q": query, "format": "json"},
+        r = await c.get(f"{base}/search", params=params,
                         headers={"Accept": "application/json"})
         r.raise_for_status()
         return [{"title": x.get("title", ""), "url": x.get("url", ""),
@@ -25,7 +28,7 @@ async def search_searxng(query: str, n: int, env: dict, timeout: int) -> list[di
                 for x in r.json().get("results", [])[:n]]
 
 
-async def search_duckduckgo(query: str, n: int, env: dict, timeout: int) -> list[dict]:
+async def search_duckduckgo(query: str, n: int, env: dict, timeout: int, opts=None) -> list[dict]:
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
                                  headers={"User-Agent": UA}) as c:
         r = await c.post("https://html.duckduckgo.com/html/", data={"q": query})
@@ -49,20 +52,21 @@ async def search_duckduckgo(query: str, n: int, env: dict, timeout: int) -> list
     return out
 
 
-async def search_tavily(query: str, n: int, env: dict, timeout: int) -> list[dict]:
+async def search_tavily(query: str, n: int, env: dict, timeout: int, opts=None) -> list[dict]:
     key = env.get("TAVILY_API_KEY")
     if not key:
         raise ProviderError("TAVILY_API_KEY missing")
     async with httpx.AsyncClient(timeout=timeout) as c:
         r = await c.post("https://api.tavily.com/search",
-                         json={"api_key": key, "query": query, "max_results": n})
+                         json={"api_key": key, "query": query, "max_results": n,
+                               **{k: v for k, v in (opts or {}).items() if k in ("time_range", "topic", "days")}})
         r.raise_for_status()
         return [{"title": x.get("title", ""), "url": x.get("url", ""),
                  "snippet": (x.get("content") or "")[:300]}
                 for x in r.json().get("results", [])[:n]]
 
 
-async def search_exa(query: str, n: int, env: dict, timeout: int) -> list[dict]:
+async def search_exa(query: str, n: int, env: dict, timeout: int, opts=None) -> list[dict]:
     key = env.get("EXA_API_KEY")
     if not key:
         raise ProviderError("EXA_API_KEY missing")
@@ -70,21 +74,23 @@ async def search_exa(query: str, n: int, env: dict, timeout: int) -> list[dict]:
         r = await c.post("https://api.exa.ai/search",
                          headers={"x-api-key": key},
                          json={"query": query, "numResults": n,
-                               "contents": {"text": {"maxCharacters": 300}}})
+                               "contents": {"text": {"maxCharacters": 300}},
+                               **{k: v for k, v in (opts or {}).items() if k in ("startPublishedDate", "category")}})
         r.raise_for_status()
         return [{"title": x.get("title", ""), "url": x.get("url", ""),
                  "snippet": (x.get("text") or "")[:300]}
                 for x in r.json().get("results", [])[:n]]
 
 
-async def search_firecrawl(query: str, n: int, env: dict, timeout: int) -> list[dict]:
+async def search_firecrawl(query: str, n: int, env: dict, timeout: int, opts=None) -> list[dict]:
     key = env.get("FIRECRAWL_API_KEY")
     if not key:
         raise ProviderError("FIRECRAWL_API_KEY missing")
     async with httpx.AsyncClient(timeout=timeout) as c:
         r = await c.post("https://api.firecrawl.dev/v2/search",
                          headers={"Authorization": f"Bearer {key}"},
-                         json={"query": query, "limit": n})
+                         json={"query": query, "limit": n,
+                               **{k: v for k, v in (opts or {}).items() if k in ("tbs",)}})
         r.raise_for_status()
         data = r.json().get("data") or {}
         items = data.get("web") or data.get("results") or []
@@ -93,7 +99,7 @@ async def search_firecrawl(query: str, n: int, env: dict, timeout: int) -> list[
                 for x in items[:n]]
 
 
-async def search_jina(query: str, n: int, env: dict, timeout: int) -> list[dict]:
+async def search_jina(query: str, n: int, env: dict, timeout: int, opts=None) -> list[dict]:
     key = env.get("JINA_API_KEY")
     if not key:
         raise ProviderError("JINA_API_KEY missing")

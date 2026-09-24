@@ -44,102 +44,118 @@ def _available_search_providers() -> list[dict]:
     return out
 
 
-async def _search_one(name: str, query: str, n: int) -> list[dict]:
+async def _search_one(name: str, query: str, n: int, opts=None) -> list[dict]:
     fn = providers.REGISTRY[name]
     try:
-        return await fn(query, n, ENV, TIMEOUT)
+        return await fn(query, n, ENV, TIMEOUT, opts=opts)
     except Exception as e:  # noqa: BLE001 - any provider failure falls through
         raise providers.ProviderError(f"{name}: {e}") from e
 
 
+_RECENCY_DAYS = {"day": 1, "week": 7, "month": 31, "year": 366}
+
+
+def _recency_opts(name: str, recency: str) -> dict:
+    """Tavily/Exa/Firecrawl-style recency, mapped to each provider's native param."""
+    if recency not in _RECENCY_DAYS:
+        return {}
+    if name in ("searxng", "tavily"):
+        return {"time_range": recency}
+    if name == "exa":
+        from datetime import date, timedelta
+        return {"startPublishedDate": str(date.today() - timedelta(days=_RECENCY_DAYS[recency]))}
+    if name == "firecrawl":
+        return {"tbs": "qdr:" + {"day": "d", "week": "w", "month": "m", "year": "y"}[recency]}
+    return {}
+
+
+def _domain_ok(url: str, include: str, exclude: str) -> bool:
+    """Tavily-style include_domains/exclude_domains (comma-separated substrings)."""
+    inc = [d.strip().lower() for d in include.split(",") if d.strip()]
+    exc = [d.strip().lower() for d in exclude.split(",") if d.strip()]
+    u = url.lower()
+    if inc and not any(d in u for d in inc):
+        return False
+    return not any(d in u for d in exc)
+
+
 @mcp.tool()
-async def web_search(query: str, num_results: int = 8, strategy: str = "fallback") -> str:
-    """Search the web. strategy=fallback: first provider that works (SearXNG -> keyless -> cloud keys).
-    strategy=merge: query top 3 providers in parallel, dedupe, diverse ranked results."""
+async def web_search(query: str, num_results: int = 8, strategy: str = "fallback",
+                     include_domains: str = "", exclude_domains: str = "",
+                     recency: str = "") -> str:
+    """Search the web. strategy=fallback: first working provider (SearXNG -> keyless -> cloud).
+    strategy=merge: top 3 providers in parallel, deduped, max 2 per domain, source-tagged.
+    include_domains/exclude_domains: comma-separated (e.g. 'reddit.com'). recency: day|week|month|year."""
     avail = _available_search_providers()
     if not avail:
         return "No search providers available (quota exhausted or none enabled)."
 
     if strategy == "merge":
         names = [p["name"] for p in avail[:3]]
-        tasks = [_search_one(n, query, num_results) for n in names]
+        tasks = [_search_one(n, query, num_results, _recency_opts(n, recency)) for n in names]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        merged, seen = [], set()
+        merged, seen, per_domain = [], set(), {}
         for name, res in zip(names, results):
             if isinstance(res, Exception):
                 continue
             quota.record(name)
             for r in res:
                 key = re.sub(r"[?#].*$", "", r["url"].rstrip("/")).lower()
-                if key not in seen:
-                    seen.add(key)
-                    merged.append({**r, "via": name})
+                dom = r["url"].split("/")[2] if "://" in r["url"] else ""
+                if key in seen or per_domain.get(dom, 0) >= 2 \
+                        or not _domain_ok(r["url"], include_domains, exclude_domains):
+                    continue
+                seen.add(key)
+                per_domain[dom] = per_domain.get(dom, 0) + 1
+                merged.append({**r, "via": name})
         if not merged:
             return f"All merge providers failed for: {query}"
         out = [f"[{r['via']}] {r['title']}\n  {r['url']}\n  {r['snippet']}" for r in merged[:num_results]]
         return "\n\n".join(out)
 
-    # fallback strategy
     errors = []
     for p in avail:
         try:
-            results = await _search_one(p["name"], query, num_results)
+            raw = await _search_one(p["name"], query, num_results,
+                                    _recency_opts(p["name"], recency))
+            results = [r for r in raw if _domain_ok(r["url"], include_domains, exclude_domains)]
             quota.record(p["name"])
-            out = [f"{r['title']}\n  {r['url']}\n  {r['snippet']}" for r in results]
+            out = [f"{r['title']}\n  {r['url']}\n  {r['snippet']}" for r in results[:num_results]]
             return f"(via {p['name']})\n" + "\n\n".join(out)
         except Exception as e:  # noqa: BLE001
             errors.append(str(e))
     return f"All providers failed for: {query}\n" + "\n".join(errors)
 
 
-def _cache_get(url: str) -> str | None:
-    f = CACHE / (hashlib.md5(url.encode()).hexdigest() + ".txt")
-    if f.exists() and time.time() - f.stat().st_mtime < CONFIG["cache_ttl_minutes"] * 60:
-        return f.read_text()[:20000]
-    return None
+@mcp.tool()
+async def news_search(query: str, num_results: int = 5, recency: str = "day") -> str:
+    """Search recent news (SearXNG news vertical, then Tavily news topic). recency: day|week|month."""
+    for name in ("searxng", "tavily"):
+        if not any(p["name"] == name for p in _available_search_providers()):
+            continue
+        opts = ({"categories": "news", "time_range": recency} if name == "searxng"
+                else {"topic": "news", "time_range": recency})
+        try:
+            results = await _search_one(name, query, num_results, opts)
+            quota.record(name)
+            out = [f"{r['title']}\n  {r['url']}\n  {r['snippet']}" for r in results[:num_results]]
+            return f"(via {name} news)\n" + "\n\n".join(out)
+        except Exception:
+            continue
+    return "News search unavailable (searxng and tavily both failed)."
 
 
-def _cache_put(url: str, text: str) -> None:
-    CACHE.mkdir(parents=True, exist_ok=True)
-    (CACHE / (hashlib.md5(url.encode()).hexdigest() + ".txt")).write_text(text[:20000])
-
-
-async def _httpx_fetch(url: str) -> str:
-    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True,
-                                 headers={"User-Agent": providers.UA}) as c:
-        r = await c.get(url)
-        if r.status_code in (403, 429, 503) or "Just a moment" in r.text[:2000]:
-            raise providers.ProviderError(f"blocked ({r.status_code})")
+@mcp.tool()
+async def suggest(query: str) -> str:
+    """Autocomplete suggestions for a partial query (DuckDuckGo, free, no key)."""
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get("https://duckduckgo.com/ac/",
+                        params={"q": query, "type": "list"},
+                        headers={"User-Agent": providers.UA})
         r.raise_for_status()
-        return r.text
-
-
-async def _curl_cffi_fetch(url: str):
-    """TLS-impersonated fetch; returns None if curl_cffi not installed."""
-    try:
-        from curl_cffi import requests as cffi
-    except ImportError:
-        return None
-    return await asyncio.to_thread(
-        lambda: cffi.get(url, impersonate="chrome", timeout=TIMEOUT,
-                         allow_redirects=True).text)
-
-
-async def _jina_fetch(url: str) -> str:
-    key = ENV.get("JINA_API_KEY")
-    if not key:
-        raise providers.ProviderError("JINA_API_KEY missing")
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(f"https://r.jina.ai/{url}",
-                        headers={"Authorization": f"Bearer {key}"})
-        r.raise_for_status()
-        return r.text
-
-
-def _strip_html(html: str) -> str:
-    html = re.sub(r"(?s)<(script|style|nav|footer|header).*?</\1>", " ", html)
-    html = re.sub(r"<[^>]+>", " ", html)
-    return re.sub(r"\s+", " ", html).strip()
+        data = r.json()
+    items = data[0] if data and isinstance(data[0], list) else data
+    return "\n".join(str(s) for s in items[:10]) or "No suggestions."
 
 
 @mcp.tool()
@@ -151,7 +167,7 @@ async def fetch_page(url: str) -> str:
         try:
             return "(reddit)\n" + await sources.reddit_fetch(url)
         except Exception as e:  # noqa: BLE001
-            return f"Reddit fetch failed ({e}); falling back to generic fetch."
+            return f"Reddit fetch failed: {e}"  # never fall through to curl_cffi for reddit
     if kind == "youtube":
         try:
             return await sources.youtube_transcript(url)
@@ -170,6 +186,11 @@ async def fetch_page(url: str) -> str:
                 attempts.append(f"{name}: empty")
                 continue
             text = _strip_html(raw) if "<" in raw[:2000] and name != "jina" else raw
+            # JS-shell detection: tiny text from a huge page = soft failure, escalate.
+            # example.com (~1KB raw) still passes; 62KB SPA shells do not.
+            if name != "jina" and len(text) < 300 and len(raw) > 20000:
+                attempts.append(f"{name}: JS shell ({len(raw)}B html -> {len(text)}ch text)")
+                continue
             _cache_put(url, text)
             return f"(via {name})\n{text[:15000]}"
         except Exception as e:  # noqa: BLE001
