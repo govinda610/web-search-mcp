@@ -5,3 +5,5 @@ PLAN.md
 __pycache__/
 *.pyc
 deploy/searxng/settings.yml
+FIX_PROMPT.md
+*_PROMPT.md
