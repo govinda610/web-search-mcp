@@ -9,18 +9,23 @@ are optional fallbacks, used only when local search fails, and every one is quot
 
 | Tool | What it does |
 |---|---|
-| `web_search(query, num_results, strategy, include_domains, exclude_domains, recency, depth, more_queries, answer, highlights, auto)` | `fallback` (local first) / `merge` / `exhaustive` (all providers parallel, deduped). Domain + recency filters. `more_queries`: up to 9 extra phrasings run in parallel, results interleaved and deduped. `depth="advanced"`: reads the top 5 pages and adds their most relevant passages. `answer`: LLM synthesis with [n] citations. `highlights`: key-fact bullets. `auto`: LLM picks strategy/recency/news routing |
+| `web_search(query, num_results, strategy, include_domains, exclude_domains, recency, depth, more_queries, filetype, page, language, safesearch, answer, highlights, auto)` | `fallback` (local first) / `merge` / `exhaustive` (all providers parallel, interleaved, deduped). Domain lists, recency, file type, result page, language and safe-search filters. `more_queries`: up to 9 extra phrasings run in parallel. `depth="advanced"`: reads the top 5 pages and adds their most relevant passages. `answer`: LLM synthesis with [n] citations. `highlights`: key-fact bullets. `auto`: LLM picks strategy/recency/news routing. Results show publish dates when known |
 | `news_search(query, num_results, recency)` | Recent news via SearXNG news vertical, Tavily as fallback |
 | `suggest(query)` | Autocomplete suggestions (DuckDuckGo, free) |
 | `image_search(query, num_results)` | Image results via SearXNG image vertical |
-| `paper_search(query, num_results, year_from)` | Papers from arXiv, Semantic Scholar, Google Scholar, PubMed, EuropePMC, OpenAIRE (via SearXNG): authors, venue, citations, DOI, PDF link |
-| `paper_fetch(ref, save_dir, max_chars, start)` | arXiv id / DOI / URL → full text. DOIs resolve to open-access copies via OpenAlex. Optionally saves the PDF |
-| `fetch_page(url, max_chars, start)` | Page or PDF → markdown. Reddit/YouTube auto-route. Long documents are paged with `start` |
-| `fetch_pages(urls, concurrency, max_chars_each)` | Concurrent multi-page fetch |
-| `reddit_fetch(target, sort, limit)` | Post body + comments via Arctic Shift archive, subreddit feeds via throttled RSS. No key, ban-safe |
-| `youtube_transcript(url, lang)` | Captions/auto-generated transcripts |
-| `media_search(query, category, num_results, sites)` | Books, comics, manga/manhwa, anime, movies, TV/K-drama, games. Parallel across sources; returns what the title is and where to get it (magnets with seeders, LibGen/Anna's Archive md5s) |
-| `book_download(md5, save_dir)` | Downloads a book/comic/paper by md5 through LibGen |
+| `knowledge_search(query, sites, num_results)` | Straight from the sources' own APIs, in parallel: Wikipedia, Hacker News, Stack Overflow, GitHub repos, OpenReview, Hugging Face papers and models, Lemmy, packages (npm, crates.io, PyPI) |
+| `live_data(kind, query)` | Stock quotes incl. NSE/BSE (Yahoo Finance), exchange rates (ECB via Frankfurter), crypto (CoinGecko), weather + 4-day forecast (Open-Meteo) |
+| `paper_search(query, num_results, year_from, year_to)` | Papers from arXiv, Semantic Scholar, Google Scholar, PubMed, EuropePMC, OpenAIRE (via SearXNG): authors, venue, citations, DOI, PDF link |
+| `paper_fetch(ref, save_dir, max_chars, start)` | arXiv id / DOI / URL → full text. DOIs resolve to open-access copies via OpenAlex, then Unpaywall. Optionally saves the PDF |
+| `fetch_page(url, max_chars, start, query, extract, fresh)` | Page or PDF → markdown. Reddit/YouTube/X/Bluesky/Telegram/Instagram auto-route. `query`: only the most relevant passages. `extract`: LLM pulls structured JSON. Long documents are paged with `start` |
+| `fetch_pages(urls, max_chars, query, concurrency)` | Up to 20 pages concurrently; a failed page shows why without sinking the batch |
+| `site_map(url, num_results, path_filter)` | A site's pages from its sitemaps (robots.txt, sitemap.xml, nested indexes, .gz), or its front-page links when it has none |
+| `reddit_fetch(target, sort, num_results)` | Post body + comments via Arctic Shift archive, subreddit feeds via throttled RSS. No key, ban-safe |
+| `youtube_transcript(url, lang, max_chars, start)` | Captions/auto-generated transcripts with [m:ss] marks, paged |
+| `social_fetch(target, num_results)` | Public posts and profiles without login: X/Twitter (fxtwitter, X embed API), Bluesky, Telegram channels, Instagram |
+| `media_search(query, category, num_results, sites)` | Books, comics, manga/manhwa, anime, movies, TV/K-drama, games, audiobooks, music, podcasts, software, subtitles. Parallel across sources; returns what the title is and where to get it (magnets with seeders, md5s, direct downloads) |
+| `book_download(md5, save_dir)` | Downloads a book/comic/paper by md5: LibGen, then Z-Library with a free account |
+| `discover_sources()` | What's new or moved since the last check in Prowlarr's indexer list and FMHY's starred sites |
 | `usage_status()` | Monthly usage per search provider, LLM call counts, current working mirror per site |
 
 ## How fetching works
@@ -56,14 +61,19 @@ are never returned as content. Extracted text is cached for an hour in `state/ca
 
 | Category | Sources |
 |---|---|
-| books | LibGen, Anna's Archive, Knaben (ebook torrents) |
-| comics | LibGen comics, GetComics, Anna's Archive |
-| manga | AniList, MangaDex, Nyaa, LibGen |
+| books | LibGen, Anna's Archive, Z-Library, Open Library, Project Gutenberg, Knaben (ebook torrents) |
+| comics | LibGen comics, GetComics, Anna's Archive, Z-Library |
+| manga | AniList, MangaUpdates, MangaDex, WeebCentral, Nyaa, LibGen |
 | anime | AniList, SubsPlease, AnimeTosho, Nyaa, Knaben |
-| movies | YTS, Knaben, The Pirate Bay, Torrents-CSV |
-| tv | TVmaze, Knaben, The Pirate Bay, Torrents-CSV |
-| games | FitGirl only: games run code on your machine, so no random uploaders |
-| torrents | Knaben, The Pirate Bay, Torrents-CSV, Nyaa |
+| movies | YTS, Knaben, The Pirate Bay, Torrents-CSV, LimeTorrents |
+| tv | TVmaze, MyDramaList (Kuryana), EZTV (episodes: "show s01e02"), Kisskh, Knaben, The Pirate Bay, Torrents-CSV, LimeTorrents |
+| subtitles | OpenSubtitles |
+| audiobooks | iTunes, Internet Archive (incl. every LibriVox recording), AudioBookBay |
+| music | iTunes, Internet Archive, Knaben, LimeTorrents |
+| podcasts | iTunes |
+| games | FitGirl and Internet Archive only: games run code on your machine, so no random uploaders |
+| software | Internet Archive |
+| torrents | Knaben, The Pirate Bay, Torrents-CSV, Nyaa, LimeTorrents |
 
 Each source uses the site's lightest endpoint (JSON API, RSS, or its search page): one
 request per search, at most one request per second per host, results cached for an hour.
@@ -76,6 +86,14 @@ refreshes the list (at most every 6 hours) from Prowlarr's indexer definitions (
 almost daily) or from [SLUM](https://open-slum.org), the shadow-library uptime monitor. A new
 domain is kept only if the adapter parses real results from it, so parked domains and
 look-alike clones are rejected. State lives in `state/mirrors.json`.
+
+**New sources.** `discover_sources` compares Prowlarr's indexer definitions and FMHY's starred
+picks against the last check (`state/discovery.json`) and lists additions, removals and sites
+whose domains changed.
+
+**Z-Library.** Search works without an account. Downloads need a free account: set
+`ZLIB_EMAIL` and `ZLIB_PASSWORD` in `.env`. The login is cached in `state/zlibrary-login.json`
+(readable only by you) because Z-Library rate-limits logins.
 
 ## Setup
 
@@ -91,7 +109,8 @@ SearXNG's defaults leave general search depending on DuckDuckGo alone. The examp
 enable Google, Bing, Yahoo and Mojeek too, so one upstream throttling you doesn't take search down.
 
 Optional keys in `.env`: `EXA_API_KEY`, `TAVILY_API_KEY`, `FIRECRAWL_API_KEY`, `JINA_API_KEY`.
-Missing keys are skipped. LLM features (`answer`/`highlights`/`auto`) read coding-plan
+Missing keys are skipped. Also optional: `ZLIB_EMAIL`/`ZLIB_PASSWORD` (Z-Library downloads),
+`UNPAYWALL_EMAIL` (a contact address Unpaywall asks for; finds more open-access papers). LLM features (`answer`/`highlights`/`auto`) read coding-plan
 credentials from `~/.pi/agent/models.json` (zai → qwen → minimax chain); if none respond,
 searches return plain result lists.
 
@@ -100,7 +119,15 @@ searches return plain result lists.
 The server sends a short "which tool when" guide as MCP instructions. Every parameter has a
 description, fixed choices are enums (`strategy`, `recency`, `depth`, `category`, `sort`,
 `sites`), numbers have ranges, and tools carry read-only / writes-files hints so clients
-can auto-approve the safe ones. Failures come back as a plain sentence saying what went wrong.
+can auto-approve the safe ones. Failed calls are MCP errors (`isError`) with a sentence saying
+what went wrong; batch tools report each failed item inline instead. Slow tools (`fetch_page`,
+`fetch_pages`, `web_search` with `depth="advanced"`) send progress notifications.
+
+**Safety.** Page content can contain prompt injections, so the fetch tools only open public
+`http(s)` URLs: `file://` and addresses on this machine or network (SearXNG, the Chrome debug
+port, your router) are refused. Set `FETCH_ALLOW_PRIVATE=1` to allow private addresses.
+Downloads are saved under their own file name only, inside `save_dir`, never over an existing
+file. Batch reads never open a visible browser window and give each page at most 45 seconds.
 
 ## Transports (MCP SDK v2)
 
