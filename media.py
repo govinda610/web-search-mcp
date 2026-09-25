@@ -15,6 +15,7 @@ import html as htmllib
 import os
 import re
 import time
+from email.message import Message
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -23,6 +24,7 @@ from curl_cffi import AsyncSession
 import fetch
 import mirrors
 import providers
+from store import STATE, load_json, save_json
 
 TOR = os.environ.get("TOR_PROXY", "socks5h://127.0.0.1:9050")
 CACHE_TTL = 3600
@@ -44,9 +46,10 @@ async def _polite(host: str) -> None:
         _last_hit[host] = time.time()
 
 
-async def http(url: str, json_body: dict | None = None, timeout: int = 12):
+async def http(url: str, json_body: dict | None = None, timeout: int = 12, form: dict | None = None,
+               cookies: dict | None = None, headers: dict | None = None):
     """GET (or POST json_body) with a Chrome fingerprint. Falls back to Tor when the
-    connection itself fails, which is what an ISP block looks like."""
+    connection itself fails, which is what an ISP block looks like; a slow site is not retried."""
     host = urlparse(url).hostname or ""
     await _polite(host)
     routes = [TOR] if host in _via_tor else [None, TOR]
@@ -54,11 +57,13 @@ async def http(url: str, json_body: dict | None = None, timeout: int = 12):
     for proxy in routes:
         try:
             async with AsyncSession() as s:
-                r = await s.request("POST" if json_body else "GET", url, json=json_body,
-                                    impersonate="chrome", proxy=proxy,
+                r = await s.request("POST" if json_body or form else "GET", url, json=json_body, data=form,
+                                    cookies=cookies, headers=headers, impersonate="chrome", proxy=proxy,
                                     timeout=timeout * 2 if proxy else timeout)
-        except Exception as e:  # noqa: BLE001 - connection failure: try the next route
-            error = e
+        except Exception as e:
+            if not fetch.is_unreachable(e):
+                raise
+            error = e  # connection cut before any HTTP: try the next route
             continue
         if proxy:
             _via_tor.add(host)
@@ -101,7 +106,7 @@ async def knaben(query: str, limit: int, category: str = "") -> list[dict]:
         "hide_unsafe": True, "hide_xxx": True})
     hits = r.json()["hits"]
     prefix = {"movies": "Movies", "tv": "TV", "anime": "Anime", "games": "PC Games",
-              "books": "Books", "comics": "Books", "manga": "Anime"}.get(category)
+              "books": "Books", "comics": "Books", "manga": "Anime", "music": "Audio"}.get(category)
     return [{"source": f"knaben/{h.get('cachedOrigin') or '?'}", "title": h["title"],
              "size": _size(h.get("bytes")), "seeders": h.get("seeders") or 0,
              "year": (h.get("date") or "")[:4], "info": h.get("category") or "",
@@ -164,7 +169,7 @@ def _rss_tag(item: str, name: str) -> str:
 
 async def nyaa(query: str, limit: int, category: str = "") -> list[dict]:
     """Nyaa: the main anime torrent tracker (also manga scans, J-drama, live action)."""
-    cat = {"anime": "1_0", "manga": "3_0"}.get(category, "0_0")
+    cat = {"anime": "1_0", "manga": "3_0", "books": "3_0"}.get(category, "0_0")  # 3_0 = literature
 
     async def attempt(base):
         r = await http(f"{base}/?page=rss&q={quote(query)}&c={cat}&f=0")
@@ -213,8 +218,8 @@ async def animetosho(query: str, limit: int, category: str = "") -> list[dict]:
 
 
 async def fitgirl(query: str, limit: int, category: str = "") -> list[dict]:
-    """FitGirl repacks: games come only from here because games are the one category that
-    runs code on your machine. fitgirl-repacks.site is the only official domain."""
+    """FitGirl repacks: PC game downloads come only from here because games are the one
+    category that runs code on your machine. fitgirl-repacks.site is the only official domain."""
     r = await http(f"https://fitgirl-repacks.site/search/{quote(query)}/feed/rss2/")
     out = []
     for item in r.text.split("<item>")[1:]:
@@ -226,6 +231,60 @@ async def fitgirl(query: str, limit: int, category: str = "") -> list[dict]:
                     "year": _rss_tag(item, "pubDate")[12:16], "url": _rss_tag(item, "link"),
                     "magnet": magnet.group(1).split("&tr=")[0]})
     return out[:limit]
+
+
+async def eztv(query: str, limit: int, category: str = "") -> list[dict]:
+    """EZTV: TV episode torrents. Its API is keyed by IMDb id, so the show is looked up on
+    TVmaze first. Add S01 or S01E02 to the query for one season/episode."""
+    words = re.sub(r"\bs\d{1,2}(e\d{1,3})?\b", "", query, flags=re.IGNORECASE).strip()
+    show = (await http(f"https://api.tvmaze.com/singlesearch/shows?q={quote(words)}")).json()
+    imdb = ((show.get("externals") or {}).get("imdb") or "").removeprefix("tt")
+    if not imdb:
+        return []
+    episode = re.search(r"\bs\d{1,2}(e\d{1,3})?\b", query, re.IGNORECASE)
+
+    async def attempt(base):
+        return (await http(f"{base}/api/get-torrents?imdb_id={imdb}&limit=100&page=1")).json()
+    data = await mirrors.call("eztv", ["https://eztvx.to", "https://eztv.wf", "https://eztv.tf"],
+                              {"prowlarr": "eztv"}, attempt)
+    out = []
+    for t in data.get("torrents") or []:
+        if episode and episode.group(0).lower() not in t["filename"].lower():
+            continue
+        out.append({"source": "eztv", "title": t["filename"], "size": _size(t.get("size_bytes")),
+                    "seeders": t.get("seeds", 0), "year": time.strftime("%Y", time.gmtime(t.get("date_released_unix", 0))),
+                    "info": f"{show['name']} S{t.get('season')}E{t.get('episode')}",
+                    "magnet": _magnet(t["hash"], t["filename"]), "hash": t["hash"].lower(),
+                    "url": t.get("episode_url", "")})
+    return sorted(out, key=lambda x: -x["seeders"])[:limit]
+
+
+LIME_GROUPS = {"movies": "Movies", "tv": "TV", "anime": "Anime", "games": "Games", "books": "Other - E-books",
+               "music": "Music"}
+
+
+async def limetorrents(query: str, limit: int, category: str = "") -> list[dict]:
+    """LimeTorrents: a general torrent index, read through its search RSS feed."""
+    async def attempt(base):
+        r = await http(f"{base}/searchrss/{quote(query)}/")
+        if "<rss" not in r.text:
+            raise RuntimeError("not a LimeTorrents RSS feed")
+        return r.text
+    xml = await mirrors.call("limetorrents", ["https://www.limetorrents.fun"], {"prowlarr": "limetorrents"}, attempt)
+    wanted = LIME_GROUPS.get(category)
+    out = []
+    for item in xml.split("<item>")[1:]:
+        infohash = re.search(r"/torrent/([0-9A-Fa-f]{40})\.torrent", item)
+        kind = _rss_tag(item, "category")
+        if not infohash or (wanted and not kind.startswith(wanted)):
+            continue
+        title = _rss_tag(item, "title")
+        seeds = re.search(r"Seeds: (\d+)", item)
+        out.append({"source": "limetorrents", "title": title, "size": _size(_rss_tag(item, "size")),
+                    "seeders": int(seeds.group(1)) if seeds else 0, "year": _rss_tag(item, "pubDate")[7:11],
+                    "info": kind, "magnet": _magnet(infohash.group(1), title), "hash": infohash.group(1).lower(),
+                    "url": _rss_tag(item, "link")})
+    return sorted(out, key=lambda x: -x["seeders"])[:limit]
 
 
 # ---------------------------------------------------------------- books, comics
@@ -312,6 +371,188 @@ async def getcomics(query: str, limit: int, category: str = "") -> list[dict]:
             for h in hits if urlparse(h["url"]).hostname == "getcomics.org"][:limit]
 
 
+ZLIB_SEEDS = ["https://z-library.ec"]
+
+
+async def zlibrary(query: str, limit: int, category: str = "") -> list[dict]:
+    """Z-Library: large ebook library. Searching needs no account; downloading (book_download)
+    uses the free account in ZLIB_EMAIL / ZLIB_PASSWORD."""
+    async def attempt(base):
+        data = (await http(f"{base}/eapi/book/search", form={"message": query, "limit": limit})).json()
+        if not data.get("success"):
+            raise RuntimeError(data.get("error") or "search refused")
+        return data["books"]
+    books = await mirrors.call("zlibrary", ZLIB_SEEDS, {"slum": "z-lib"}, attempt)
+    return [{"source": "zlibrary", "title": b["title"], "size": b.get("filesizeString", ""), "seeders": 0,
+             "year": str(b.get("year") or ""),
+             "info": " · ".join(str(x) for x in (b.get("author"), b.get("language"), b.get("extension"),
+                                                 b.get("publisher")) if x),
+             "md5": b.get("md5"), "url": b.get("href", "")}
+            for b in books if b.get("md5")]
+
+
+async def openlibrary(query: str, limit: int, category: str = "") -> list[dict]:
+    """Open Library: book records, with a link to read or borrow a scan on the Internet Archive."""
+    r = await http(f"https://openlibrary.org/search.json?q={quote(query)}&limit={limit}"
+                   "&fields=title,key,author_name,first_publish_year,ia,ebook_access")
+    out = []
+    for d in r.json().get("docs", []):
+        access = d.get("ebook_access", "no_ebook")
+        out.append({"source": "openlibrary", "title": d["title"], "size": "", "seeders": 0,
+                    "year": str(d.get("first_publish_year") or ""),
+                    "info": " · ".join(x for x in (", ".join(d.get("author_name", [])[:2]), access.replace("_", " ")) if x),
+                    "url": f"https://archive.org/details/{d['ia'][0]}" if d.get("ia") and access != "no_ebook"
+                    else f"https://openlibrary.org{d['key']}"})
+    return out
+
+
+async def gutenberg(query: str, limit: int, category: str = "") -> list[dict]:
+    """Project Gutenberg's own OPDS catalog: free public-domain ebooks with direct EPUB links."""
+    r = await http(f"https://www.gutenberg.org/ebooks/search.opds/?query={quote(query)}", timeout=20)
+    out = []
+    for entry in re.findall(r"<entry>(.*?)</entry>", r.text, re.DOTALL):
+        book = re.search(r"/ebooks/(\d+)\.opds", entry)
+        if not book:
+            continue  # the feed also lists "sort by" and author links
+        out.append({"source": "gutenberg", "title": _rss_tag(entry, "title"), "size": "", "seeders": 0, "year": "",
+                    "info": _rss_tag(re.sub(r"<content[^>]*>", "<content>", entry), "content"),
+                    "url": f"https://www.gutenberg.org/ebooks/{book.group(1)}",
+                    "download": f"https://www.gutenberg.org/ebooks/{book.group(1)}.epub3.images"})
+    return out[:limit]
+
+
+# ---------------------------------------------------------------- manga, drama, subtitles
+
+async def weebcentral(query: str, limit: int, category: str = "") -> list[dict]:
+    """WeebCentral: manga/manhwa reader with most series in English (Comick's successor)."""
+    r = await http(f"https://weebcentral.com/search/data?text={quote(query)}&display_mode=Minimal%20Display"
+                   f"&limit={limit}&sort=Best%20Match&order=Descending", headers={"HX-Request": "true"})
+    out = []
+    for card in r.text.split("<article")[1:limit + 1]:
+        link = re.search(r'href="(https://weebcentral\.com/series/[^"]+)"', card)
+        if not link:
+            continue
+        facts = [_text(x) for x in re.findall(r"(?s)<div>(.*?)</div>", card)]
+        out.append({"source": "weebcentral", "title": _text(re.search(r"(?s)<h2[^>]*>(.*?)</h2>", card).group(1)),
+                    "size": "", "seeders": 0, "year": next((f for f in facts if re.fullmatch(r"\d{4}", f)), ""),
+                    "info": " · ".join(f for f in facts if not re.fullmatch(r"\d{4}", f)), "url": link.group(1)})
+    return out
+
+
+async def mangaupdates(query: str, limit: int, category: str = "") -> list[dict]:
+    """MangaUpdates: the reference catalog for manga/manhwa/manhua: type, year, rating, status."""
+    r = await http("https://api.mangaupdates.com/v1/series/search", {"search": query, "perpage": limit})
+    out = []
+    for hit in r.json().get("results", [])[:limit]:
+        rec = hit["record"]
+        out.append({"source": "mangaupdates", "title": _text(rec["title"]), "size": "", "seeders": 0,
+                    "year": str(rec.get("year") or ""),
+                    "info": " · ".join(str(x) for x in (rec.get("type"), rec.get("bayesian_rating") and
+                                                        f"rating {rec['bayesian_rating']}") if x),
+                    "url": rec.get("url", "")})
+    return out
+
+
+async def kuryana(query: str, limit: int, category: str = "") -> list[dict]:
+    """MyDramaList (via the Kuryana API): Asian dramas: country, episodes, rating, rank."""
+    r = await http(f"https://kuryana.tbdh.app/search/q/{quote(query)}", timeout=20)
+    return [{"source": "mydramalist", "title": d["title"], "size": "", "seeders": 0, "year": str(d.get("year") or ""),
+             "info": " · ".join(str(x) for x in (d.get("type"), d.get("series"), d.get("rating") and f"rating {d['rating']}",
+                                                 d.get("ranking") and f"rank {d['ranking']}") if x),
+             "url": f"https://mydramalist.com/{d['slug'].split('-', 1)[0]}"}
+            for d in r.json().get("results", {}).get("dramas", [])[:limit]]
+
+
+async def kisskh(query: str, limit: int, category: str = "") -> list[dict]:
+    """Kisskh: streams most Asian dramas with English subtitles. Usually reached through Tor."""
+    r = await http(f"https://kisskh.co/api/DramaList/Search?q={quote(query)}&type=0", timeout=20)
+    return [{"source": "kisskh", "title": d["title"], "size": "", "seeders": 0, "year": "",
+             "info": " · ".join(x for x in (f"{d.get('episodesCount')} episodes", d.get("label")) if x),
+             "url": f"https://kisskh.co/Drama/{quote(d['title'].replace(' ', '-'))}?id={d['id']}"}
+            for d in r.json()[:limit]]
+
+
+async def opensubtitles(query: str, limit: int, category: str = "") -> list[dict]:
+    """OpenSubtitles: English subtitles (.srt in a zip) for films and TV, K-drama included."""
+    r = await http(f"https://www.opensubtitles.org/en/search/sublanguageid-eng/moviename-{quote(query)}/rss_2_00")
+    out = []
+    for item in r.text.split("<item>")[1:limit + 1]:
+        zip_url = re.search(r'url="([^"]+)"[^>]*type="application/zip"|type="application/zip" url="([^"]+)"', item)
+        released = re.search(r"Released as: ([^;]+);", item)
+        out.append({"source": "opensubtitles", "title": _rss_tag(item, "title").removesuffix(" - subtitles"),
+                    "size": "", "seeders": 0, "year": _rss_tag(item, "pubDate")[12:16],
+                    "info": f"released as {released.group(1).strip()}" if released else "",
+                    "url": _rss_tag(item, "link"), "download": (zip_url.group(1) or zip_url.group(2)) if zip_url else ""})
+    return out
+
+
+# ---------------------------------------------------------------- audio, software
+
+ITUNES_MEDIA = {"audiobooks": "audiobook", "podcasts": "podcast", "music": "music"}
+
+
+async def itunes(query: str, limit: int, category: str = "") -> list[dict]:
+    """Apple's catalog: audiobooks (narrator, length), podcasts (with RSS feed URL), albums."""
+    media_type = ITUNES_MEDIA.get(category, "all")
+    entity = "&entity=album" if media_type == "music" else ""
+    r = await http(f"https://itunes.apple.com/search?term={quote(query)}&media={media_type}{entity}&limit={limit}")
+    out = []
+    for x in r.json().get("results", []):
+        out.append({"source": "itunes", "title": x.get("collectionName") or x.get("trackName", ""), "size": "",
+                    "seeders": 0, "year": (x.get("releaseDate") or "")[:4],
+                    "info": " · ".join(str(v) for v in (x.get("artistName"), x.get("primaryGenreName"),
+                                                        x.get("trackCount") and f"{x['trackCount']} tracks") if v),
+                    "url": x.get("feedUrl") or x.get("collectionViewUrl") or x.get("trackViewUrl", "")})
+    return out
+
+
+async def audiobookbay(query: str, limit: int, category: str = "") -> list[dict]:
+    """AudioBookBay: audiobook torrents; the magnet is on each result's page."""
+    async def attempt(base):
+        r = await http(f"{base}/?s={quote(query)}")
+        if 'class="post"' not in r.text and "Nothing was found" not in r.text:
+            raise RuntimeError("not an AudioBookBay results page")
+        return base, r.text
+    base, page = await mirrors.call("audiobookbay", ["https://audiobookbay.lu", "https://audiobookbay.is"], {}, attempt)
+    out = []
+    for post in page.split('<div class="post">')[1:limit + 1]:
+        link = re.search(r'(?s)class="postTitle"><h2><a href="([^"]+)"[^>]*>(.*?)</a>', post)
+        if not link:
+            continue
+        posted = re.search(r"Posted: [^<]*?(\d{4})", post)
+        fmt = re.search(r"Format: <span[^>]*>([^<]+)", post)
+        size = re.search(r"File Size: <span[^>]*>([^<]+)</span>\s*(\w+)", post)
+        language = re.search(r"Language: ([^<]+)", post)
+        out.append({"source": "audiobookbay", "title": _text(link.group(2)), "seeders": 0,
+                    "size": f"{size.group(1)} {size.group(2)}" if size else "", "year": posted.group(1) if posted else "",
+                    "info": " · ".join(x.group(1).strip() for x in (fmt, language) if x),
+                    "url": link.group(1) if link.group(1).startswith("http") else base + link.group(1)})
+    return out
+
+
+ARCHIVE_FILTERS = {"audiobooks": "mediatype:audio AND (subject:audiobook OR collection:librivoxaudio)",
+                   "music": "mediatype:audio",
+                   "software": "mediatype:software", "games": "mediatype:software", "books": "mediatype:texts"}
+
+
+async def archive_org(query: str, limit: int, category: str = "") -> list[dict]:
+    """Internet Archive: public-domain and preserved books, audio, live concerts and old
+    software/DOS games, most popular first."""
+    kind = ARCHIVE_FILTERS.get(category, "")
+    q = f"title:({query})" + (f" AND {kind}" if kind else "")
+    r = await http(f"https://archive.org/advancedsearch.php?q={quote(q)}&fl[]=identifier&fl[]=title&fl[]=year"
+                   f"&fl[]=creator&fl[]=mediatype&fl[]=downloads&sort[]=downloads+desc&rows={limit}&output=json")
+    out = []
+    for d in r.json()["response"]["docs"]:
+        creator = d.get("creator")
+        out.append({"source": "archive.org", "title": str(d.get("title", d["identifier"])), "size": "", "seeders": 0,
+                    "year": str(d.get("year") or ""),
+                    "info": " · ".join(str(x) for x in (creator[0] if isinstance(creator, list) else creator,
+                                                        d.get("mediatype"), f"{d.get('downloads', 0)} downloads") if x),
+                    "url": f"https://archive.org/details/{d['identifier']}"})
+    return out
+
+
 # ---------------------------------------------------------------- catalogs
 
 async def mangadex(query: str, limit: int, category: str = "") -> list[dict]:
@@ -365,16 +606,22 @@ async def tvmaze(query: str, limit: int, category: str = "") -> list[dict]:
 
 # ---------------------------------------------------------------- routing
 
-CATALOGS = {"anilist", "mangadex", "tvmaze"}  # what a title is; everything else is where to get it
+# What a title is; everything else is where to get it.
+CATALOGS = {"anilist", "mangadex", "mangaupdates", "tvmaze", "kuryana", "itunes"}
 SOURCES = {
-    "books": [libgen, annas_archive, knaben],
-    "comics": [libgen, getcomics, annas_archive],
-    "manga": [anilist, mangadex, nyaa, libgen],
+    "books": [libgen, annas_archive, zlibrary, openlibrary, gutenberg, knaben],
+    "comics": [libgen, getcomics, annas_archive, zlibrary],
+    "manga": [anilist, mangaupdates, mangadex, weebcentral, nyaa, libgen],
     "anime": [anilist, subsplease, animetosho, nyaa, knaben],
-    "movies": [yts, knaben, piratebay, torrents_csv],
-    "tv": [tvmaze, knaben, piratebay, torrents_csv],
-    "games": [fitgirl],
-    "torrents": [knaben, piratebay, torrents_csv, nyaa],
+    "movies": [yts, knaben, piratebay, torrents_csv, limetorrents],
+    "tv": [tvmaze, kuryana, eztv, kisskh, knaben, piratebay, torrents_csv, limetorrents],
+    "subtitles": [opensubtitles],
+    "audiobooks": [itunes, archive_org, audiobookbay],
+    "music": [itunes, archive_org, knaben, limetorrents],
+    "podcasts": [itunes],
+    "games": [fitgirl, archive_org],
+    "software": [archive_org],
+    "torrents": [knaben, piratebay, torrents_csv, nyaa, limetorrents],
 }
 SOURCES["all"] = list(dict.fromkeys(f for fns in SOURCES.values() for f in fns))
 
@@ -385,6 +632,8 @@ async def _cached(fn, query: str, limit: int, category: str):
     if hit and time.time() - hit[0] < CACHE_TTL:
         return hit[1]
     results = await asyncio.wait_for(fn(query, limit, category), timeout=150)
+    for old in [k for k, (at, _) in _cache.items() if time.time() - at > CACHE_TTL]:
+        del _cache[old]
     _cache[key] = (time.time(), results)
     return results
 
@@ -425,6 +674,8 @@ def format_results(catalog: list[dict], found: list[dict], notes: list[str], lim
         for k in ("url", "magnet"):
             if r.get(k):
                 out += f"\n  {r[k]}"
+        if r.get("download"):
+            out += f"\n  download: {r['download']}"
         if r.get("md5"):
             out += f"\n  md5: {r['md5']} (book_download)"
         return out
@@ -437,7 +688,50 @@ def format_results(catalog: list[dict], found: list[dict], notes: list[str], lim
 
 
 async def book_download(md5: str, save_dir: str) -> str:
-    """Download a book/comic/paper by md5 through LibGen's download page."""
+    """Download a book/comic/paper by md5: LibGen first, then Z-Library (free account)."""
+    try:
+        r = await _libgen_file(md5)
+    except Exception as libgen_error:
+        if not os.environ.get("ZLIB_EMAIL"):
+            raise RuntimeError(f"LibGen: {libgen_error}. Set ZLIB_EMAIL/ZLIB_PASSWORD in .env "
+                               "to also try Z-Library") from libgen_error
+        try:
+            r = await _zlibrary_file(md5)
+        except Exception as zlib_error:
+            raise RuntimeError(f"LibGen: {libgen_error}; Z-Library: {zlib_error}") from zlib_error
+    return save_download(r, md5, save_dir)
+
+
+ZLIB_LOGIN = STATE / "zlibrary-login.json"
+
+
+async def _zlibrary_file(md5: str):
+    """Find the book by md5, then ask for its file link with the account's cookies. The login
+    is cached, because Z-Library rate-limits logins."""
+    async def attempt(base):
+        login = load_json(ZLIB_LOGIN)
+        if not login:
+            data = (await http(f"{base}/eapi/user/login", form={
+                "email": os.environ["ZLIB_EMAIL"], "password": os.environ.get("ZLIB_PASSWORD", "")})).json()
+            if not data.get("success"):
+                raise RuntimeError(f"login failed: {data.get('error') or data}"[:160])
+            login = {"remix_userid": str(data["user"]["id"]), "remix_userkey": data["user"]["remix_userkey"]}
+            save_json(ZLIB_LOGIN, login, private=True)
+        found = (await http(f"{base}/eapi/book/search", form={"message": md5, "limit": 5})).json()
+        book = next((b for b in found.get("books", []) if b.get("md5") == md5), None)
+        if not book:
+            raise RuntimeError("md5 not on Z-Library")
+        link = (await http(f"{base}/eapi/book/{book['id']}/{book['hash']}/file", cookies=login)).json()
+        url = (link.get("file") or {}).get("downloadLink")
+        if not url:
+            if "auth" in str(link).lower():
+                ZLIB_LOGIN.unlink(missing_ok=True)  # stale login: log in again next time
+            raise RuntimeError(f"no download link: {link.get('error') or link}"[:160])
+        return await http(url, cookies=login, timeout=300)
+    return await mirrors.call("zlibrary", ZLIB_SEEDS, {"slum": "z-lib"}, attempt)
+
+
+async def _libgen_file(md5: str):
     async def attempt(base):
         page = await http(f"{base}/ads.php?md5={md5}")
         link = re.search(r'href="(get\.php\?md5=[0-9a-f]{32}&(?:amp;)?key=\w+)"', page.text)
@@ -445,11 +739,22 @@ async def book_download(md5: str, save_dir: str) -> str:
             raise RuntimeError("no download link on the page")
         r = await http(f"{base}/{htmllib.unescape(link.group(1))}", timeout=300)
         return r
-    r = await mirrors.call("libgen", ["https://libgen.li", "https://libgen.bz", "https://libgen.vg"],
-                           {"slum": "libgen"}, attempt)
-    name = re.search(r'filename="?([^";]+)', r.headers.get("content-disposition", ""))
-    filename = name.group(1) if name else f"{md5}.{(r.headers.get('content-type', '').split('/')[-1] or 'bin')}"
-    path = Path(save_dir).expanduser() / re.sub(r"[/\\]", "_", filename)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    return await mirrors.call("libgen", ["https://libgen.li", "https://libgen.bz", "https://libgen.vg"],
+                              {"slum": "libgen"}, attempt)
+
+
+def save_download(r, md5: str, save_dir: str) -> str:
+    """Save a download under its Content-Disposition name, never outside save_dir and never
+    over an existing file."""
+    header = Message()
+    header["content-disposition"] = r.headers.get("content-disposition", "")
+    name = Path(header.get_filename() or "").name  # get_filename decodes filename*=UTF-8''...
+    if name.strip(". ") == "":
+        name = f"{md5}.{(r.headers.get('content-type', '').split('/')[-1].split(';')[0] or 'bin')}"
+    folder = Path(save_dir).expanduser()
+    folder.mkdir(parents=True, exist_ok=True)
+    path, n = folder / name, 1
+    while path.exists():
+        path, n = folder / f"{Path(name).stem} ({n}){Path(name).suffix}", n + 1
     path.write_bytes(r.content)
     return f"saved {len(r.content):,} bytes to {path}"

@@ -2,13 +2,16 @@
 
 Search: SearXNG's science category fans out to arXiv, Semantic Scholar, Google Scholar,
 PubMed, EuropePMC and OpenAIRE locally, no keys. Results are deduped by title.
-Resolve: arXiv id/URL -> arXiv PDF; DOI -> open-access PDF via OpenAlex (keyless lookup).
+Resolve: arXiv id/URL -> arXiv PDF; DOI -> open-access PDF via OpenAlex (keyless lookup),
+then Unpaywall when UNPAYWALL_EMAIL is set (it asks for a contact address, no key).
 """
+import os
 import re
 
 import httpx
 
 OPENALEX = "https://api.openalex.org/works/https://doi.org/"
+UNPAYWALL = "https://api.unpaywall.org/v2/"
 
 
 def _norm_title(title: str) -> str:
@@ -19,7 +22,8 @@ def _clean(value) -> str:
     return "" if value in (None, "None") else str(value)
 
 
-async def search(query: str, n: int, searxng_url: str, timeout: int, year_from: int = 0) -> list[dict]:
+async def search(query: str, n: int, searxng_url: str, timeout: int, year_from: int = 0,
+                 year_to: int = 0) -> list[dict]:
     async with httpx.AsyncClient(timeout=timeout) as c:
         r = await c.get(f"{searxng_url.rstrip('/')}/search",
                         params={"q": query, "format": "json", "categories": "science"})
@@ -28,8 +32,8 @@ async def search(query: str, n: int, searxng_url: str, timeout: int, year_from: 
     for x in r.json().get("results", []):
         m = re.match(r"\d{4}", _clean(x.get("publishedDate")))
         year = int(m.group(0)) if m else 0
-        if year_from and year < year_from:
-            continue
+        if year and ((year_from and year < year_from) or (year_to and year > year_to)):
+            continue  # papers with no known year are kept rather than silently dropped
         key = _norm_title(x.get("title", ""))
         if not key:
             continue
@@ -91,4 +95,11 @@ async def resolve(ref: str, timeout: int) -> tuple[str, str]:
         oa_url = best.get("pdf_url") or (work.get("open_access") or {}).get("oa_url")
         if oa_url:
             return oa_url, f"DOI {doi}: open-access copy via OpenAlex"
+    email = os.environ.get("UNPAYWALL_EMAIL")
+    if email:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.get(UNPAYWALL + doi, params={"email": email})
+        best = (r.json().get("best_oa_location") or {}) if r.status_code == 200 else {}
+        if best.get("url_for_pdf") or best.get("url"):
+            return best.get("url_for_pdf") or best["url"], f"DOI {doi}: open-access copy via Unpaywall"
     return f"https://doi.org/{doi}", f"DOI {doi}: no open-access copy found, trying publisher page"

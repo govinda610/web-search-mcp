@@ -8,14 +8,15 @@ drops to the back. When every known domain fails, the list is refreshed (at most
 A new domain is only kept if the site's own adapter parses real results from it, so
 parked domains and malware clones that merely answer HTTP 200 are rejected.
 """
-import json
 import re
 import time
-from pathlib import Path
 
 from curl_cffi import AsyncSession
 
-STATE = Path(__file__).parent / "state" / "mirrors.json"
+from store import STATE as STATE_DIR
+from store import load_json, save_json
+
+STATE = STATE_DIR / "mirrors.json"
 REFRESH_AFTER = 6 * 3600
 PROWLARR = "https://raw.githubusercontent.com/Prowlarr/Indexers/master/definitions/v11/{}.yml"
 SLUM_PAGES = ("https://open-slum.org/", "https://open-slum.pages.dev/")
@@ -31,13 +32,12 @@ _state: dict | None = None  # one shared copy, so parallel searches don't overwr
 def _load() -> dict:
     global _state
     if _state is None:
-        _state = json.loads(STATE.read_text()) if STATE.exists() else {}
+        _state = load_json(STATE)
     return _state
 
 
 def _save(state: dict) -> None:
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    STATE.write_text(json.dumps(state, indent=1))
+    save_json(STATE, state)
 
 
 async def _get(url: str) -> str:

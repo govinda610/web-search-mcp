@@ -10,8 +10,10 @@ PDF -> text via pymupdf. Extracted text is cached on disk for an hour.
 import asyncio
 import hashlib
 import html as htmllib
+import ipaddress
 import os
 import re
+import socket
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -47,8 +49,15 @@ BROWSER_SLOTS = asyncio.Semaphore(2)  # each Camoufox instance is a full browser
 TOR = os.environ.get("TOR_PROXY", "socks5h://127.0.0.1:9050")
 VIA_TOR: set[str] = set()  # hosts that only answer through Tor, learned this session
 # curl errors that mean the connection was cut before any HTTP happened: an ISP block, not the site.
-UNREACHABLE = ("Could not resolve host", "Connection timed out", "Connection refused",
-               "Connection reset", "Recv failure", "SSL_ERROR_SYSCALL")
+# 6 DNS, 7 refused, 35 TLS handshake cut, 56 reset. 28 counts only while connecting: an ISP block
+# drops the connection attempt, while a slow site times out mid-response ("Operation timed out").
+UNREACHABLE_CODES = (6, 7, 35, 56)
+FETCH_DEADLINE = 45  # seconds for one page in a batch (depth=advanced, fetch_pages)
+
+
+def is_unreachable(e: Exception) -> bool:
+    code = getattr(e, "code", None)
+    return code in UNREACHABLE_CODES or (code == 28 and "Connection timed out" in str(e))
 
 
 class FetchError(Exception):
@@ -69,6 +78,31 @@ def is_challenge(body: bytes) -> bool:
 
 def is_pdf(content_type: str, body: bytes) -> bool:
     return "pdf" in content_type or body[:5] == b"%PDF-"
+
+
+def is_binary(content_type: str, body: bytes) -> bool:
+    """Images, video, archives: nothing an agent can read as text. PDFs are binary too, but readable."""
+    if is_pdf(content_type, body):
+        return False
+    return content_type.startswith(("image/", "audio/", "video/")) or b"\0" in body[:2000]
+
+
+async def check_url(url: str) -> None:
+    """Only public http(s) pages. Stops a prompt-injected page from steering the agent to local
+    files (file://) or to services on this machine or network (SearXNG, the Chrome debug port)."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise FetchError(f"only http(s) URLs can be fetched, not {url[:80]!r}")
+    if os.environ.get("FETCH_ALLOW_PRIVATE") == "1":
+        return
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, parsed.hostname, None)
+    except OSError:
+        return  # not resolvable here (an ISP DNS block); Tor resolves it remotely
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            raise FetchError(f"{parsed.hostname} is a local/private address; set FETCH_ALLOW_PRIVATE=1 to allow")
 
 
 def strip_html(html: str) -> str:
@@ -105,7 +139,7 @@ async def _camoufox(url: str, timeout: int, proxy: str | None = None, headless: 
         options["proxy"] = {"server": proxy.replace("socks5h://", "socks5://")}
     async with BROWSER_SLOTS, AsyncCamoufox(headless=headless, **options) as browser:
         page = await browser.new_page(storage_state=COOKIES if COOKIES.exists() else None)
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 2000)
+        response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 2000)
         # Automatic challenges clear within ~5s. A visible window also waits for you to click
         # through a manual check (DDoS-Guard captcha, "I'm not a robot" box).
         for _ in range(15 if headless else HUMAN_WAIT):
@@ -120,9 +154,11 @@ async def _camoufox(url: str, timeout: int, proxy: str | None = None, headless: 
         if not headless and not is_challenge(body):
             COOKIES.parent.mkdir(parents=True, exist_ok=True)
             await page.context.storage_state(path=COOKIES)
-    # The navigation status is the challenge's 403 even when it was solved, so report
-    # success and let fetch() judge the final content with is_challenge().
-    return 200, "text/html", body
+            COOKIES.chmod(0o600)  # logged-in session cookies
+    # A solved challenge still reports its 403/503, so only a hard status (404, 410, ...) is kept;
+    # otherwise report success and let fetch() judge the final content with is_challenge().
+    status = response.status if response else 200
+    return (status if status >= 400 and status not in RETRYABLE else 200), "text/html", body
 
 
 async def _jina(url: str, timeout: int, proxy: str | None = None):  # Jina fetches from its own servers
@@ -173,32 +209,39 @@ STAGES = [("curl_cffi", _curl_cffi), ("camoufox", _camoufox), ("chrome_cdp", _ch
           ("camoufox_visible", _camoufox_visible), ("jina", _jina)]
 
 
-async def fetch(url: str, timeout: int = 15) -> Page:
-    """Run the stage chain; if the site is unreachable directly, run it again through Tor."""
+async def fetch(url: str, timeout: int = 15, interactive: bool = True, on_stage=None) -> Page:
+    """Run the stage chain; if the site is unreachable directly, run it again through Tor.
+    interactive=False never opens a visible window (for batch reads nobody is watching).
+    on_stage(name) is awaited before each stage, for progress reporting."""
+    await check_url(url)
     host = urlparse(url).hostname or ""
     if host in VIA_TOR:
-        return await _escalate(url, timeout, TOR)
+        return await _escalate(url, timeout, TOR, interactive, on_stage)
     try:
-        return await _escalate(url, timeout, None)
+        return await _escalate(url, timeout, None, interactive, on_stage)
     except FetchError as direct:
         if not str(direct).startswith("unreachable"):
             raise
         try:
-            page = await _escalate(url, timeout, TOR)
+            page = await _escalate(url, timeout, TOR, interactive, on_stage)
         except FetchError as tor:
             raise FetchError(f"{direct}; via Tor: {tor}") from tor
     VIA_TOR.add(host)
     return page._replace(via=page.via + "+tor")
 
 
-async def _escalate(url: str, timeout: int, proxy: str | None) -> Page:
+async def _escalate(url: str, timeout: int, proxy: str | None, interactive: bool = True, on_stage=None) -> Page:
     """Escalate through STAGES until one returns real content. Raises FetchError with every attempt."""
     attempts = []
     for name, stage in STAGES:
+        if name == "camoufox_visible" and not interactive:
+            continue
+        if on_stage:
+            await on_stage(name + (" via Tor" if proxy else ""))
         try:
             status, content_type, body = await stage(url, timeout, proxy)
         except Exception as e:  # noqa: BLE001 - any stage failure escalates to the next
-            if name == "curl_cffi" and any(m in str(e) for m in UNREACHABLE):
+            if name == "curl_cffi" and is_unreachable(e):
                 # a browser can't get past a cut connection either; skip straight to the Tor retry
                 raise FetchError(f"unreachable ({str(e)[:120]})") from e
             attempts.append(f"{name}: {type(e).__name__}: {e}"[:200])
@@ -208,7 +251,9 @@ async def _escalate(url: str, timeout: int, proxy: str | None) -> Page:
         if status in RETRYABLE or is_challenge(body):
             attempts.append(f"{name}: blocked (HTTP {status})")
             continue
-        text = to_text(url, content_type, body)
+        if is_binary(content_type, body):
+            raise FetchError(f"{name}: not a readable page ({content_type or 'binary data'}, {len(body):,} bytes)")
+        text = await asyncio.to_thread(to_text, url, content_type, body)  # pymupdf/trafilatura are CPU-bound
         # A JS app shell: lots of HTML, almost no text. The browser stage renders it.
         if name == "curl_cffi" and len(text) < 300 and len(body) > 20000:
             attempts.append(f"{name}: JS shell ({len(body)}B html -> {len(text)} chars text)")
@@ -233,15 +278,19 @@ def cache_get(url: str) -> str | None:
 
 def cache_put(url: str, text: str) -> None:
     CACHE.mkdir(parents=True, exist_ok=True)
+    for old in CACHE.glob("*.txt"):  # drop expired entries so the cache doesn't grow forever
+        if time.time() - old.stat().st_mtime > CACHE_TTL:
+            old.unlink(missing_ok=True)
     _cache_file(url).write_text(text)
 
 
-async def fetch_text(url: str, timeout: int = 15) -> tuple[str, str]:
-    """(via, text), served from cache when fresh."""
-    cached = cache_get(url)
+async def fetch_text(url: str, timeout: int = 15, fresh: bool = False, interactive: bool = True,
+                     on_stage=None) -> tuple[str, str]:
+    """(via, text), served from cache when fresh unless fresh=True."""
+    cached = None if fresh else cache_get(url)
     if cached is not None:
         return "cache", cached
-    page = await fetch(url, timeout)
+    page = await fetch(url, timeout, interactive, on_stage)
     cache_put(url, page.text)
     return page.via, page.text
 

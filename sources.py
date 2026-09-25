@@ -15,12 +15,31 @@ _RSS_MIN_INTERVAL = 60.0
 _RSS_CACHE_TTL = 300.0
 _rss_last_hit = 0.0
 _rss_cache: dict = {}
+_rss_lock = asyncio.Lock()  # one Reddit request at a time, so concurrent calls can't burst
 
 ARCTIC = "https://arctic-shift.photon-reddit.com/api"
 
 
 async def _throttled_reddit_get(url: str, timeout: int) -> str:
     """RSS GET with 60s min interval, 5-min cache, Retry-After backoff (max 3 attempts)."""
+    async with _rss_lock:
+        return await _reddit_get_locked(url, timeout)
+
+
+def _retry_after(r) -> float:
+    """Retry-After is seconds or an HTTP date; fall back to a minute."""
+    value = r.headers.get("retry-after", r.headers.get("x-ratelimit-reset", "60")).split(",")[0]
+    try:
+        return float(value)
+    except ValueError:
+        from email.utils import parsedate_to_datetime
+        try:
+            return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+        except (TypeError, ValueError):
+            return 60.0
+
+
+async def _reddit_get_locked(url: str, timeout: int) -> str:
     global _rss_last_hit
     now = time.time()
     if url in _rss_cache and now - _rss_cache[url][0] < _RSS_CACHE_TTL:
@@ -36,21 +55,19 @@ async def _throttled_reddit_get(url: str, timeout: int) -> str:
         if r.status_code == 429:
             if attempt == 2:
                 raise ProviderError("reddit 429: rate limit persists after 3 attempts")
-            ra = float(r.headers.get("retry-after",
-                       r.headers.get("x-ratelimit-reset", "60")).split(",")[0])
-            await asyncio.sleep(ra * (1 + 0.5 * attempt) + random.uniform(0, 5))
+            await asyncio.sleep(_retry_after(r) * (1 + 0.5 * attempt) + random.uniform(0, 5))
             continue
         r.raise_for_status()
         _rss_cache[url] = (time.time(), r.text)
         return r.text
 
 
-async def _arctic_post(post_id: str, timeout: int):
+async def _arctic_post(post_id: str, timeout: int, limit: int = 10):
     """Post title/body + top comments from the Arctic Shift archive (free, no auth), or None."""
     async with httpx.AsyncClient(timeout=timeout) as c:
         post_r, comments_r = await asyncio.gather(
             c.get(f"{ARCTIC}/posts/ids", params={"ids": post_id}),
-            c.get(f"{ARCTIC}/comments/tree", params={"link_id": post_id, "limit": 12}))
+            c.get(f"{ARCTIC}/comments/tree", params={"link_id": post_id, "limit": limit + 2}))
     post_r.raise_for_status()
     comments_r.raise_for_status()
     posts = post_r.json().get("data") or []
@@ -62,7 +79,7 @@ async def _arctic_post(post_id: str, timeout: int):
     if post.get("selftext"):
         lines.append(post["selftext"][:3000])
     lines.append("COMMENTS:")
-    for cm in (comments_r.json().get("data") or [])[:10]:
+    for cm in (comments_r.json().get("data") or [])[:limit]:
         if isinstance(cm, dict) and isinstance(cm.get("data"), dict):
             cm = cm["data"]  # arctic returns reddit-listing-style {kind, data} wrappers
         body = (cm.get("body") or "").replace("\n", " ")[:350]
@@ -105,7 +122,7 @@ async def _reddit_rss(sub: str, sort: str, limit: int, timeout: int) -> str:
     return "\n".join(out) if out else f"No entries for r/{sub}"
 
 
-def _format_post_rss(text: str, target: str) -> str:
+def _format_post_rss(text: str, target: str, limit: int = 10) -> str:
     import html as htmllib
 
     def clean(s):
@@ -115,7 +132,7 @@ def _format_post_rss(text: str, target: str) -> str:
 
     entries = re.findall(r"<entry>(.*?)</entry>", text, re.S)
     out = []
-    for i, e in enumerate(entries[:12]):
+    for i, e in enumerate(entries[:limit + 1]):  # the first entry is the post itself
         title = re.search(r"<title>(.*?)</title>", e, re.S)
         content = re.search(r'<content type="html">(.*?)</content>', e, re.S)
         if i == 0 and title:
@@ -124,7 +141,7 @@ def _format_post_rss(text: str, target: str) -> str:
             body = clean(content.group(1))
             if body:
                 out.append(f"  > {body[:350]}")
-    return "\n".join(out[:15]) if out else f"No content for {target}"
+    return "\n".join(out) if out else f"No content for {target}"
 
 
 async def reddit_fetch(target: str, sort: str = "hot", limit: int = 15,
@@ -134,7 +151,7 @@ async def reddit_fetch(target: str, sort: str = "hot", limit: int = 15,
         m = re.search(r"/comments/([a-z0-9]+)", target)
         if m:
             try:
-                post = await _arctic_post(m.group(1), timeout)
+                post = await _arctic_post(m.group(1), timeout, limit)
                 if post:
                     return "(via arctic-shift archive)\n" + post
             except Exception:
@@ -142,7 +159,7 @@ async def reddit_fetch(target: str, sort: str = "hot", limit: int = 15,
         url = target.rstrip("/")
         if url.endswith(".json"):
             url = url[:-5]
-        return _format_post_rss(await _throttled_reddit_get(url + ".rss", timeout), target)
+        return _format_post_rss(await _throttled_reddit_get(url + f".rss?limit={limit}", timeout), target, limit)
     sub = target.removeprefix("r/").strip("/")
     return await _reddit_rss(sub, sort, limit, timeout)
 
@@ -156,12 +173,17 @@ def _yt_id(url: str) -> str:
 
 
 async def youtube_transcript(url: str, lang: str = "en") -> str:
-    """Transcript text for a YouTube video (captions or auto-generated). Free, no API key."""
+    """Transcript for a YouTube video (captions or auto-generated), one [mm:ss] mark about every
+    30 seconds so passages can be cited. Free, no API key."""
     from youtube_transcript_api import YouTubeTranscriptApi
 
     vid = _yt_id(url)
     api = YouTubeTranscriptApi()
     fetched = await asyncio.to_thread(api.fetch, vid, languages=[lang, "en", "hi"])
-    parts = [sn.text for sn in fetched]
-    text = " ".join(parts)
-    return f"(video {vid}, {len(parts)} segments)\n{text[:15000]}"
+    lines, next_mark = [], 0.0
+    for sn in fetched:
+        if sn.start >= next_mark:
+            lines.append(f"\n[{int(sn.start // 60)}:{int(sn.start % 60):02d}]")
+            next_mark = sn.start + 30
+        lines.append(sn.text)
+    return f"(video {vid}, language {fetched.language_code})\n" + " ".join(lines).strip()

@@ -1,9 +1,9 @@
 """Per-provider monthly usage tracking. State: state/usage-YYYY-MM.json (human-readable)."""
-import json
 from datetime import date
 from pathlib import Path
 
-STATE_DIR = Path(__file__).parent / "state"
+from store import STATE as STATE_DIR
+from store import load_json, save_json
 
 
 def _usage_file() -> Path:
@@ -11,18 +11,14 @@ def _usage_file() -> Path:
 
 
 def _load() -> dict:
-    f = _usage_file()
-    if f.exists():
-        return json.loads(f.read_text())
-    return {}
+    return load_json(_usage_file())
 
 
 def record(provider: str) -> None:
     """Increment this month's counter for a provider."""
     usage = _load()
     usage[provider] = usage.get(provider, 0) + 1
-    STATE_DIR.mkdir(exist_ok=True)
-    _usage_file().write_text(json.dumps(usage, indent=2, sort_keys=True))
+    save_json(_usage_file(), usage)
 
 
 def used_this_month(provider: str) -> int:

@@ -17,7 +17,8 @@ async def search_searxng(query: str, n: int, env: dict, timeout: int, opts=None)
         raise ProviderError("SEARXNG_URL not configured")
     params = {"q": query, "format": "json"}
     if opts:
-        params.update({k: v for k, v in opts.items() if k in ("time_range", "categories")})
+        params.update({k: v for k, v in opts.items()
+                       if k in ("time_range", "categories", "pageno", "language", "safesearch")})
     async with httpx.AsyncClient(timeout=timeout) as c:
         r = await c.get(f"{base}/search", params=params,
                         headers={"Accept": "application/json"})
@@ -27,7 +28,7 @@ async def search_searxng(query: str, n: int, env: dict, timeout: int, opts=None)
         down = ", ".join(f"{e} ({why})" for e, why in data["unresponsive_engines"])
         raise ProviderError(f"searxng: no results, upstream engines down: {down}")
     return [{"title": x.get("title", ""), "url": x.get("url", ""),
-             "snippet": (x.get("content") or "")[:300],
+             "snippet": (x.get("content") or "")[:300], "published": (x.get("publishedDate") or "")[:10],
              **({"img_src": x["img_src"], "thumbnail": x.get("thumbnail_src", "")}
                 if x.get("img_src") else {})}
             for x in data.get("results", [])[:n]]
@@ -65,10 +66,11 @@ async def search_tavily(query: str, n: int, env: dict, timeout: int, opts=None) 
     async with httpx.AsyncClient(timeout=timeout) as c:
         r = await c.post("https://api.tavily.com/search",
                          json={"api_key": key, "query": query, "max_results": n,
-                               **{k: v for k, v in (opts or {}).items() if k in ("time_range", "topic", "days")}})
+                               **{k: v for k, v in (opts or {}).items()
+                                  if k in ("time_range", "topic", "days", "include_domains", "exclude_domains")}})
         r.raise_for_status()
         return [{"title": x.get("title", ""), "url": x.get("url", ""),
-                 "snippet": (x.get("content") or "")[:300]}
+                 "snippet": (x.get("content") or "")[:300], "published": (x.get("published_date") or "")[:10]}
                 for x in r.json().get("results", [])[:n]]
 
 
@@ -81,10 +83,11 @@ async def search_exa(query: str, n: int, env: dict, timeout: int, opts=None) -> 
                          headers={"x-api-key": key},
                          json={"query": query, "numResults": n,
                                "contents": {"text": {"maxCharacters": 300}},
-                               **{k: v for k, v in (opts or {}).items() if k in ("startPublishedDate", "category")}})
+                               **{k: v for k, v in (opts or {}).items()
+                                  if k in ("startPublishedDate", "category", "includeDomains", "excludeDomains")}})
         r.raise_for_status()
         return [{"title": x.get("title", ""), "url": x.get("url", ""),
-                 "snippet": (x.get("text") or "")[:300]}
+                 "snippet": (x.get("text") or "")[:300], "published": (x.get("publishedDate") or "")[:10]}
                 for x in r.json().get("results", [])[:n]]
 
 
