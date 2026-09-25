@@ -891,6 +891,23 @@ async def transport_http():
             r = await c.post("http://127.0.0.1:8766/mcp", headers={**h, "Host": "evil.example"}, json={
                 "jsonrpc": "2.0", "id": 1, "method": "ping"})
             ok("transport: http rejects foreign Host (DNS rebinding)", r.status_code in (400, 403, 421), r.status_code)
+
+            ui_h = {"X-Requested-With": "web-search-ui"}
+            r = await c.get("http://127.0.0.1:8766/")
+            ok("ui: page served", r.status_code == 200 and "<title>web-search</title>" in r.text, r.status_code)
+            r = await c.get("http://127.0.0.1:8766/", headers={"Host": "evil.example"})
+            ok("ui: page rejects foreign Host", r.status_code == 403, r.status_code)
+            r = await c.get("http://127.0.0.1:8766/ui/api/sources")
+            ok("ui: api needs the page's header (no cross-site calls)", r.status_code == 403, r.status_code)
+            r = await c.get("http://127.0.0.1:8766/ui/api/sources", headers=ui_h)
+            ok("ui: sources lists every tab", {"searxng", "papers", "knowledge", "media"} <= set(r.json()), list(r.json()))
+            r = await c.get("http://127.0.0.1:8766/ui/api/search", headers=ui_h, timeout=60,
+                            params={"tab": "knowledge", "q": "tokio", "sources": "wikipedia,github"})
+            events = [json.loads(line) for line in r.text.splitlines()]
+            panels = {e["name"]: e for e in events if e["type"] == "source"}
+            ok("ui: search streams one panel per source", [events[0]["type"], events[-1]["type"]] == ["start", "done"]
+               and set(panels) == {"wikipedia", "github"} and any(p["results"] for p in panels.values()),
+               {n: (p["status"], len(p["results"])) for n, p in panels.items()})
     finally:
         proc.terminate()
 

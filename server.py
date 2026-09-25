@@ -45,6 +45,7 @@ import similar
 import social
 import sources
 import torrent
+import ui
 import watch
 import wayback
 
@@ -975,6 +976,8 @@ def _slim(schema: dict) -> dict:
 
 for _tool in mcp._tool_manager.list_tools():  # the SDK has no public hook for this
     _slim(_tool.parameters)
+
+ui.register(mcp, ENV, fetch_page, media_download, book_download)  # the search page at http://127.0.0.1:8765/
 
 if __name__ == "__main__":
     if os.environ.get("MCP_TRANSPORT", "stdio") == "http":

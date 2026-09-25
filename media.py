@@ -953,7 +953,7 @@ async def _retry_queries(query: str, category: str) -> list[tuple[str, str]]:
     if stripped and stripped != query:
         out.append(("year dropped", stripped))
     for alt in await movies.alt_titles(query, category):
-        if alt.lower() != query.lower():
+        if alt.lower() not in (query.lower(), stripped.lower()):
             out.append(("alt title", alt))
     return out[:3]
 

@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>web-search</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#d9dde6; --dim:#8b93a5; --accent:#6ea8fe;
+          --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; --chip:#1f2430; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 -apple-system, "Segoe UI", sans-serif; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  button, select, input { font:inherit; color:var(--text); background:var(--chip); border:1px solid var(--line);
+                          border-radius:6px; padding:5px 9px; }
+  button { cursor:pointer; } button:hover { border-color:var(--accent); }
+  header { position:sticky; top:0; z-index:5; background:var(--bg); border-bottom:1px solid var(--line); padding:10px 16px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:4px 0; }
+  .tabs button.on, .view button.on { background:var(--accent); color:#0b1020; border-color:var(--accent); }
+  #q { flex:1; min-width:240px; font-size:16px; padding:8px 12px; }
+  .label { color:var(--dim); font-size:12px; }
+  .chips { display:flex; gap:5px; flex-wrap:wrap; }
+  .chip { font-size:12px; padding:2px 8px; border-radius:12px; background:var(--chip); border:1px solid var(--line);
+          cursor:pointer; user-select:none; white-space:nowrap; }
+  .chip.on { border-color:var(--accent); color:#fff; }
+  .chip.off { opacity:.45; }
+  .chip.ok { border-color:var(--ok); } .chip.empty { border-color:var(--dim); opacity:.7; }
+  .chip.error, .chip.skipped { border-color:var(--bad); color:var(--bad); } .chip.wait { border-style:dashed; }
+  main { padding:12px 16px 80px; max-width:1200px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; margin:10px 0; }
+  .panel > h3 { margin:0; padding:8px 12px; font-size:14px; display:flex; gap:10px; align-items:center; cursor:pointer; }
+  .panel.collapsed > .body { display:none; }
+  .panel .err { color:var(--bad); padding:0 12px 10px; font-size:13px; }
+  .card { padding:9px 12px; border-top:1px solid var(--line); }
+  .card .t { font-size:15px; font-weight:500; }
+  .card .u { color:var(--dim); font-size:12px; word-break:break-all; }
+  .card .m { font-size:12px; color:var(--dim); margin-top:2px; display:flex; gap:10px; flex-wrap:wrap; }
+  .card .s { margin-top:3px; color:#b8bfcc; }
+  .card .w { color:var(--warn); font-size:12px; }
+  .card .a { margin-top:5px; display:flex; gap:6px; flex-wrap:wrap; }
+  .card .a button { font-size:12px; padding:2px 8px; }
+  .seed { color:var(--ok); } .q { color:var(--accent); } .src { color:#c4b5fd; }
+  .card.withimg { display:flex; gap:10px; } .card img { max-width:140px; max-height:100px; border-radius:4px; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:18px 0 4px; }
+  #summary { color:var(--dim); font-size:13px; }
+  #drawer { position:fixed; top:0; right:0; bottom:0; width:min(720px, 100%); background:var(--panel); z-index:10;
+            border-left:1px solid var(--line); display:none; flex-direction:column; }
+  #drawer.open { display:flex; }
+  #drawer header { position:static; display:flex; gap:8px; align-items:center; }
+  #drawer pre { flex:1; overflow:auto; margin:0; padding:14px 16px; white-space:pre-wrap; font:13px/1.5 ui-monospace, monospace; }
+  #downloads { position:fixed; right:12px; bottom:12px; width:min(420px, 95%); z-index:9; }
+  #downloads .job { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 10px;
+                    margin-top:6px; font-size:12px; }
+  #downloads .job pre { white-space:pre-wrap; margin:4px 0 0; max-height:120px; overflow:auto; }
+  .hidden { display:none !important; }
+  @media (max-width: 700px) { header { position:static; } main { padding:8px; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <div class="tabs row" id="tabs"></div>
+    <input id="q" list="history" placeholder="Search…  (press / to focus)" autocomplete="off">
+    <datalist id="history"></datalist>
+    <button id="go">Search</button>
+  </div>
+  <div class="row" id="options"></div>
+  <div class="row"><span class="label">sources</span><span class="chips" id="sources"></span>
+    <span class="label"><a href="#" id="all">all</a> · <a href="#" id="none">none</a> · <a href="#" id="dflt">default</a></span></div>
+  <div class="row"><span class="label">status</span><span class="chips" id="status"></span><span id="summary"></span></div>
+  <div class="row">
+    <span class="view row" id="view"><button data-v="merged" class="on">Merged</button><button data-v="sources">By source</button></span>
+    <input id="filter" placeholder="Filter results…" style="min-width:200px">
+    <span id="mediaFilters" class="row">
+      <label class="label">min seeders <input id="minSeed" type="number" min="0" value="0" style="width:70px"></label>
+      <select id="res"><option value="">any resolution</option><option>2160</option><option>1080</option><option>720</option><option>480</option></select>
+      <label class="label"><input type="checkbox" id="hideCam" checked> hide cinema recordings</label>
+      <label class="label"><input type="checkbox" id="hideFlagged"> hide flagged</label>
+    </span>
+    <select id="sort"><option value="">best first</option><option value="seeders">most seeders</option>
+      <option value="size">largest</option><option value="date">newest</option><option value="title">title</option></select>
+  </div>
+</header>
+<main id="results"><p class="label">Search to see what every source returns.</p></main>
+
+<div id="drawer"><header><button id="close">✕</button><span id="readTitle" class="u"></span></header><pre id="readText"></pre></div>
+<div id="downloads"></div>
+
+<script>
+const H = { "X-Requested-With": "web-search-ui" };
+const TABS = { web: "Web", papers: "Papers", knowledge: "Knowledge", media: "Media" };
+const SXNG_CATS = ["general", "news", "images", "videos", "science", "it", "files", "music", "social media"];
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const safeUrl = u => /^(https?:|magnet:)/i.test(u || "") ? u : "";
+const store = { get: (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
+                set: (k, v) => localStorage.setItem(k, JSON.stringify(v)) };
+
+let SOURCES = null, state = { tab: "web", category: "", view: "merged" }, run = null;
+
+// ---------- sources and options ----------
+function available() {
+  if (!SOURCES) return [];
+  const t = state.tab;
+  if (t === "web") return SOURCES.searxng[state.category || "general"] || [];
+  if (t === "papers") return [...(SOURCES.searxng.science || []), ...SOURCES.papers];
+  if (t === "knowledge") return SOURCES.knowledge.all;
+  return SOURCES.media[state.category || "all"] || [];
+}
+function defaults() {
+  // web/papers/media: every source unless you pick some; knowledge: the tool's default set
+  return state.tab === "knowledge" ? SOURCES.knowledge.default : available();
+}
+const selKey = () => `sel:${state.tab}:${state.category}`;
+const selected = () => store.get(selKey(), null) ?? defaults();
+
+function renderTabs() {
+  $("tabs").innerHTML = Object.entries(TABS).map(([k, v]) =>
+    `<button data-tab="${k}" class="${k === state.tab ? "on" : ""}">${v}</button>`).join("");
+}
+function renderOptions() {
+  const o = $("options"), t = state.tab;
+  const opts = (vals, cur) => vals.map(v => `<option ${v === cur ? "selected" : ""}>${esc(v)}</option>`).join("");
+  if (t === "web") {
+    o.innerHTML = `<select id="cat">${opts(SXNG_CATS, state.category || "general")}</select>
+      <select id="time"><option value="">any time</option><option value="day">past day</option><option value="week">past week</option>
+        <option value="month">past month</option><option value="year">past year</option></select>
+      <input id="lang" placeholder="language (e.g. en, de)" style="width:170px">
+      <select id="safe"><option value="0">safe search off</option><option value="1">moderate</option><option value="2">strict</option></select>
+      <label class="label">page <input id="page" type="number" min="1" value="1" style="width:60px"></label>`;
+  } else if (t === "media") {
+    o.innerHTML = `<select id="cat">${opts(Object.keys(SOURCES?.media || {}), state.category || "all")}</select>
+      <label class="label">per source <input id="limit" type="number" min="1" max="50" value="10" style="width:60px"></label>`;
+  } else {
+    o.innerHTML = `<label class="label">per source <input id="limit" type="number" min="1" max="50" value="10" style="width:60px"></label>`;
+  }
+  const cat = $("cat");
+  if (cat) cat.onchange = () => { state.category = cat.value; renderSources(); };
+  $("mediaFilters").classList.toggle("hidden", t !== "media");
+}
+function renderSources() {
+  const sel = new Set(selected()), skipped = SOURCES?.skipped || {};
+  $("sources").innerHTML = available().map(n => {
+    const why = skipped[n] ? ` title="failing repeatedly; retried in ${Math.ceil(skipped[n] / 60)} min"` : "";
+    return `<span class="chip ${sel.has(n) ? "on" : "off"} ${skipped[n] ? "skipped" : ""}" data-src="${esc(n)}"${why}>${esc(n)}</span>`;
+  }).join("") || `<span class="label">${SOURCES ? "none for this category" : "loading…"}</span>`;
+}
+function toggleSource(n) {
+  const sel = new Set(selected());
+  sel.has(n) ? sel.delete(n) : sel.add(n);
+  store.set(selKey(), [...sel]);
+  renderSources();
+}
+
+// ---------- search ----------
+async function search(push = true) {
+  const q = $("q").value.trim();
+  if (!q) return;
+  if (run) run.abort();
+  run = new AbortController();
+  const hist = [q, ...store.get("history", []).filter(h => h !== q)].slice(0, 30);
+  store.set("history", hist);
+  $("history").innerHTML = hist.map(h => `<option value="${esc(h)}">`).join("");
+
+  const sel = selected(), all = available();
+  const p = new URLSearchParams({ tab: state.tab, q });
+  if (state.category) p.set("category", state.category);
+  if (sel.length) p.set("sources", sel.join(","));  // named explicitly, every engine reports back, even with 0 results
+  const val = id => $(id)?.value;
+  if (val("limit")) p.set("limit", val("limit"));
+  if (state.tab === "web") {
+    if (val("time")) p.set("time_range", val("time"));
+    if (val("lang")) p.set("language", val("lang"));
+    p.set("safesearch", val("safe"));
+    if (+val("page") > 1) p.set("pageno", val("page"));
+  }
+  if (push) history.pushState(null, "", "?" + new URLSearchParams({ tab: state.tab, q, ...(state.category ? { category: state.category } : {}) }));
+
+  Object.assign(state, { panels: {}, merged: null, started: performance.now(), finished: null,
+                         pending: new Set(sel.length ? sel : all) });
+  render();
+  try {
+    const r = await fetch("/ui/api/search?" + p, { headers: H, signal: run.signal });
+    if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) { handle(JSON.parse(buf.slice(0, i))); buf = buf.slice(i + 1); }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") $("summary").textContent = "Search failed: " + e.message;
+  }
+}
+function handle(ev) {
+  if (ev.type === "source") {
+    state.panels[ev.name] = ev;
+    state.pending.delete(ev.name);
+  } else if (ev.type === "merged") state.merged = ev;
+  else if (ev.type === "done") { state.pending.clear(); state.finished = performance.now(); }
+  render();
+}
+
+// ---------- rendering ----------
+function card(r, showSource = true) {
+  const url = safeUrl(r.url), img = safeUrl(r.thumbnail || r.img_src);
+  const srcs = r.engines?.length ? r.engines : r.source ? [r.source] : [];
+  const meta = [
+    showSource && srcs.length ? `<span class="src">${esc(srcs.join(", "))}</span>` : "",
+    r.quality_label ? `<span class="q">${esc(r.quality_label)}</span>` : "",
+    r.seeders ? `<span class="seed">▲ ${r.seeders}</span>` : "", r.leechers ? `▼ ${r.leechers}` : "",
+    r.size ? esc(r.size) : "", (r.date || r.year) && !String(r.info || "").startsWith(r.date || r.year) ? esc(r.date || r.year) : "", r.venue ? esc(r.venue) : "",
+    r.authors?.length ? esc(r.authors.slice(0, 4).join(", ") + (r.authors.length > 4 ? " et al." : "")) : "",
+    r.info ? esc(r.info) : "", r.doi ? `doi: ${esc(r.doi)}` : "",
+  ].filter(Boolean).map(x => x.startsWith("<span") ? x : `<span>${x}</span>`).join("");
+  const acts = [
+    url ? `<button data-open="${esc(url)}">Open</button>` : "",
+    /^https?:/.test(url) ? `<button data-read="${esc(url)}">Read</button>` : "",
+    safeUrl(r.pdf) ? `<button data-read="${esc(r.pdf)}">Read PDF</button>` : "",
+    r.magnet ? `<button data-copy="${esc(r.magnet)}">Copy magnet</button><button data-dl="${esc(r.magnet)}" data-label="${esc(r.title)}">Download</button>` : "",
+    r.md5 ? `<button data-md5="${esc(r.md5)}" data-label="${esc(r.title)}">Download book</button>` : "",
+    safeUrl(r.download) ? `<button data-open="${esc(r.download)}">Download page</button>` : "",
+    state.tab === "web" && ["videos", "music"].includes(state.category) && url
+      ? `<button data-dl="${esc(url)}" data-fmt="mp4" data-label="${esc(r.title)}">Save mp4</button><button data-dl="${esc(url)}" data-fmt="mp3" data-label="${esc(r.title)}">Save mp3</button>` : "",
+  ].join("");
+  return `<div class="card ${img ? "withimg" : ""}">${img ? `<img loading="lazy" src="${esc(img)}" alt="">` : ""}<div>
+    <div class="t">${url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(r.title || url)}</a>` : esc(r.title)}</div>
+    ${url && !url.startsWith("magnet:") ? `<div class="u">${esc(url)}</div>` : ""}
+    ${meta ? `<div class="m">${meta}</div>` : ""}
+    ${r.snippet || r.abstract ? `<div class="s">${esc((r.snippet || r.abstract).slice(0, 400))}</div>` : ""}
+    ${(r.warnings || []).map(w => `<div class="w">⚠ ${esc(w)}</div>`).join("")}
+    <div class="a">${acts}</div></div></div>`;
+}
+const sizeBytes = s => { const m = /([\d.]+)\s*([KMGT]?i?B)/i.exec(s || ""); if (!m) return 0;
+  return +m[1] * 1024 ** ("BKMGT".indexOf(m[2][0].toUpperCase())); };
+function filtered(list) {
+  const f = $("filter").value.toLowerCase().trim(), media = state.tab === "media";
+  const minSeed = +$("minSeed").value || 0, res = $("res").value;
+  let out = list.filter(r => !f || `${r.title} ${r.snippet || ""} ${r.abstract || ""} ${r.url} ${r.info || ""}`.toLowerCase().includes(f));
+  if (media) out = out.filter(r => !r.magnet || ((r.seeders || 0) >= minSeed && (!res || (r.resolution || "").startsWith(res))
+                                                 && !($("hideFlagged").checked && r.warnings?.length)));
+  const by = $("sort").value;
+  const keyed = { seeders: r => -(r.seeders || 0), size: r => -sizeBytes(r.size), title: r => (r.title || "").toLowerCase(),
+                  date: r => -(Date.parse(r.date || r.year) || 0) }[by];
+  if (keyed) out = [...out].sort((a, b) => (keyed(a) > keyed(b)) - (keyed(a) < keyed(b)));
+  else if (media) out = [...out].sort((a, b) => bestKey(a).localeCompare(bestKey(b)));
+  return out;
+}
+function bestKey(r) {  // the media tool's order: flagged last, then quality tier, resolution, seeders
+  const res = parseInt(r.resolution) || 0;
+  return [r.warnings?.length ? 1 : 0, 9 - (r.tier ?? 0), String(9999 - res).padStart(4, "0"), String(1e7 - (r.seeders || 0)).padStart(8, "0")].join("|");
+}
+function mergedList() {
+  const panels = Object.values(state.panels).filter(p => p.results.length), out = [], seen = new Set();
+  const key = r => (r.url || "").replace(/^https?:\/\/(www\.)?/, "").replace(/[/#]+$/, "").toLowerCase() || r.title;
+  const titleKey = r => (r.title || "").toLowerCase().replace(/\W+/g, "");
+  let lists = panels.map(p => p.results);
+  if (lists.every(l => l.every(r => r.rank !== undefined)))  // one SearXNG answer: keep its ranking
+    lists = [lists.flat().sort((a, b) => a.rank - b.rank)];
+  for (let i = 0; i < Math.max(0, ...lists.map(l => l.length)); i++)
+    for (const l of lists) {
+      const r = l[i];
+      if (!r) continue;
+      const k1 = key(r), k2 = state.tab === "papers" ? titleKey(r) : k1;
+      if (seen.has(k1) || seen.has(k2)) continue;
+      seen.add(k1); seen.add(k2); out.push(r);
+    }
+  return out;
+}
+function render() {
+  const names = [...new Set([...Object.keys(state.panels || {}), ...(state.pending || [])])];
+  const secs = ms => ms != null ? ` ${(ms / 1000).toFixed(1)}s` : "";
+  $("status").innerHTML = names.map(n => {
+    const p = state.panels[n];
+    if (!p) return `<span class="chip wait">${esc(n)} …</span>`;
+    const tip = p.error ? ` title="${esc(p.error)}"` : "";
+    const what = p.status === "ok" ? p.results.length : p.error ? p.error.slice(0, 40) : p.status;
+    return `<span class="chip ${p.status}" data-jump="${esc(n)}"${tip}>${esc(n)}: ${esc(what)}${secs(p.ms)}</span>`;
+  }).join("");
+  const done = Object.values(state.panels || {}), ok = done.filter(p => p.status === "ok").length;
+  const total = done.reduce((s, p) => s + p.results.length, 0);
+  const end = state.finished ?? (state.pending?.size ? null : performance.now());
+  $("summary").textContent = state.started ? `${ok}/${done.length} sources returned ${total} results` +
+    (state.pending?.size ? ` · waiting on ${state.pending.size}` : end ? ` · ${((end - state.started) / 1000).toFixed(1)}s` : "") : "";
+
+  let html = "";
+  if (state.view === "sources") {
+    const order = done.sort((a, b) => (b.results.length - a.results.length) || a.name.localeCompare(b.name));
+    html = order.map(p => {
+      const list = filtered(p.results);
+      return `<div class="panel" id="p-${esc(p.name)}"><h3 data-collapse>${esc(p.name)}
+        <span class="chip ${p.status}">${p.status === "ok" ? `${list.length}${list.length !== p.results.length ? ` of ${p.results.length}` : ""}` : p.status}</span>
+        <span class="label">${secs(p.ms)}</span></h3>
+        ${p.error ? `<div class="err">${esc(p.error)}</div>` : ""}
+        <div class="body">${list.map(r => card(r, false)).join("")}</div></div>`;
+    }).join("");
+  } else if (state.tab === "media") {
+    const m = state.merged;
+    if (!m) html = `<p class="label">${done.length ? "Merging when every source has answered — switch to By source to see them now." : "Searching…"}</p>`;
+    else {
+      const all = filtered(m.results), cams = all.filter(r => r.is_cam), main = all.filter(r => !r.is_cam);
+      if (m.catalog.length) html += `<h2>What it is</h2><div class="panel">${m.catalog.slice(0, 3).map(r => card(r)).join("")}
+        ${m.catalog.length > 3 ? `<details><summary class="card label">${m.catalog.length - 3} more matches</summary>${m.catalog.slice(3).map(r => card(r)).join("")}</details>` : ""}</div>`;
+      html += `<h2>Where to get it (${main.length})</h2><div class="panel">${main.map(r => card(r)).join("") || '<div class="card label">Nothing downloadable found.</div>'}</div>`;
+      if (cams.length && !$("hideCam").checked)
+        html += `<h2>Cinema recordings (filmed in a theatre)</h2><div class="panel">${cams.map(r => card(r)).join("")}</div>`;
+      else if (cams.length) html += `<p class="label">${cams.length} cinema recordings hidden.</p>`;
+      if (m.retries?.length) html += `<p>Nothing downloadable. Try: ${m.retries.map(t =>
+        `<button data-retry="${esc(t.query)}">${esc(t.query)} (${esc(t.why)})</button>`).join(" ")}</p>`;
+    }
+  } else {
+    const list = filtered(mergedList());
+    html = list.length ? `<div class="panel">${list.map(r => card(r)).join("")}</div>`
+      : `<p class="label">${state.pending?.size ? "Searching…" : "No results."}</p>`;
+  }
+  $("results").innerHTML = html;
+}
+
+// ---------- reading and downloads ----------
+async function read(url) {
+  $("drawer").classList.add("open"); $("readTitle").textContent = url; $("readText").textContent = "Reading…";
+  const r = await fetch("/ui/api/read", { method: "POST", headers: { ...H, "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
+  const d = await r.json();
+  $("readText").textContent = d.text ?? ("Couldn't read it: " + d.error);
+}
+async function download(body) {
+  await fetch("/ui/api/download", { method: "POST", headers: { ...H, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  pollJobs();
+}
+let polling = null;
+async function pollJobs() {
+  const jobs = await (await fetch("/ui/api/jobs", { headers: H })).json();
+  const hidden = store.get("hiddenJobs", []);
+  $("downloads").innerHTML = jobs.filter(j => !hidden.includes(j.id)).slice(0, 5).map(j => `<div class="job">
+    <b>${j.status === "running" ? "⏳" : j.status === "done" ? "✓" : "✗"}</b> ${esc(j.label)}
+    <a href="#" data-hide="${j.id}" style="float:right">dismiss</a>
+    <pre>${esc(j.status === "running" ? j.progress || "starting…" : j.result)}</pre></div>`).join("");
+  clearTimeout(polling);
+  if (jobs.some(j => j.status === "running")) polling = setTimeout(pollJobs, 1500);
+}
+
+// ---------- events ----------
+document.addEventListener("click", e => {
+  const t = e.target.closest("[data-tab],[data-src],[data-v],[data-open],[data-read],[data-copy],[data-dl],[data-md5],[data-jump],[data-collapse],[data-retry],[data-hide]");
+  if (!t) return;
+  const d = t.dataset;
+  if (d.tab) { state.tab = d.tab; state.category = ""; renderTabs(); renderOptions(); renderSources(); }
+  else if (d.src) toggleSource(d.src);
+  else if (d.v) { state.view = d.v; document.querySelectorAll("#view button").forEach(b => b.classList.toggle("on", b === t)); render(); }
+  else if (d.open) window.open(d.open, "_blank", "noopener");
+  else if (d.read) read(d.read);
+  else if (d.copy) { navigator.clipboard.writeText(d.copy); t.textContent = "Copied"; }
+  else if (d.dl) { download({ url: d.dl, format: d.fmt, label: d.label }); t.textContent = "Started"; }
+  else if (d.md5) { download({ md5: d.md5, label: d.label }); t.textContent = "Started"; }
+  else if (d.jump) { if (state.view !== "sources") document.querySelector('#view [data-v="sources"]').click();
+                     document.getElementById("p-" + d.jump)?.scrollIntoView({ behavior: "smooth" }); }
+  else if (d.collapse !== undefined) t.parentElement.classList.toggle("collapsed");
+  else if (d.retry) { $("q").value = d.retry; search(); }
+  else if (d.hide) { e.preventDefault(); store.set("hiddenJobs", [...store.get("hiddenJobs", []), +d.hide]); pollJobs(); }
+});
+const setSel = list => e => { e.preventDefault(); store.set(selKey(), list()); renderSources(); };
+$("all").onclick = setSel(() => available());
+$("none").onclick = setSel(() => []);
+$("dflt").onclick = e => { e.preventDefault(); localStorage.removeItem(selKey()); renderSources(); };
+$("go").onclick = () => search();
+$("q").onkeydown = e => { if (e.key === "Enter") search(); };
+["filter", "minSeed", "res", "hideCam", "hideFlagged", "sort"].forEach(id => $(id).addEventListener("input", render));
+$("close").onclick = () => $("drawer").classList.remove("open");
+document.addEventListener("keydown", e => {
+  if (e.key === "/" && !["INPUT", "SELECT"].includes(document.activeElement.tagName)) { e.preventDefault(); $("q").focus(); }
+  if (e.key === "Escape") $("drawer").classList.remove("open");
+});
+function fromUrl() {
+  const p = new URLSearchParams(location.search);
+  state.tab = TABS[p.get("tab")] ? p.get("tab") : "web";
+  state.category = p.get("category") || "";
+  $("q").value = p.get("q") || "";
+  renderTabs(); renderOptions(); renderSources();
+  if ($("q").value) search(false);
+}
+window.onpopstate = fromUrl;
+
+(async () => {
+  $("history").innerHTML = store.get("history", []).map(h => `<option value="${esc(h)}">`).join("");
+  SOURCES = await (await fetch("/ui/api/sources", { headers: H })).json();
+  fromUrl(); pollJobs();
+})();
+</script>
+</body>
+</html>

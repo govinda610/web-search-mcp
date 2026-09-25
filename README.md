@@ -202,6 +202,31 @@ Save as `~/Library/LaunchAgents/com.web-search-mcp.plist` (fix the two paths), t
 `PATH` must reach ffmpeg, deno and tor. After pulling changes:
 `launchctl kickstart -k gui/$(id -u)/com.web-search-mcp`.
 
+## Search page
+
+In HTTP mode the same server also serves a search page for people at `http://127.0.0.1:8765/`.
+The tools merge their sources into one answer for an agent; the page shows what every source
+returned on its own, as each one finishes, next to the merged list.
+
+- **Tabs.** Web (any SearXNG category: general, news, images, videos, science, IT, files, music,
+  social media), Papers, Knowledge and Media (movies, TV, books, anime, games, torrents…).
+- **One panel per source.** Each SearXNG engine, knowledge source, paper source and media site
+  gets its own panel. The status bar shows each one's result count and time, or why it failed
+  ("google: Suspended: CAPTCHA", "duckduckgo: timeout") or that it's being skipped for failing repeatedly.
+- **Pick sources.** Click a source to leave it out; the choice is remembered per tab and category.
+- **Merged view.** For Media, the tool's own merge: quality grades, fake and cinema-recording
+  warnings, and near-duplicate releases shown once. A film with nothing downloadable offers the
+  year-less and alternate-title searches as buttons.
+- **Filter and sort** without searching again: text, minimum seeders, resolution, hide cinema
+  recordings or flagged results; sort by seeders, size, date or title.
+- **Actions.** Read a page or PDF as clean text (same fetching as `fetch_page`), copy a magnet,
+  download a torrent, book or video/audio (same as the download tools), with progress.
+- Searches go into the address bar, so back/forward and bookmarks work; `/` focuses the search box.
+
+It answers only as `127.0.0.1`/`localhost`, and its API calls need a header a cross-site page
+can't send without a CORS preflight, which these routes never answer, so a web page you visit
+can't make your server search or download things.
+
 ## Wiring agents
 
 ```bash
