@@ -10,6 +10,8 @@ import fetch
 CDX = "https://web.archive.org/cdx/search/cdx"
 AVAILABLE = "https://archive.org/wayback/available"
 RETRIES = 3  # archive.org's APIs return transient 5xx/400s under load often enough to need this
+# quote() leaves / and : unescaped: AVAILABLE has been seen silently returning no snapshot for a
+# URL it does have archived once its ':' and '//' are percent-encoded (confirmed by hand).
 
 
 async def _get_json(q: str):
@@ -32,7 +34,7 @@ async def _get_json(q: str):
 
 async def snapshots(url: str, limit: int = 20, year_from: int | None = None, year_to: int | None = None) -> str:
     """Archived snapshots of url, newest first, deduped by content (collapse=digest)."""
-    q = (f"{CDX}?url={quote(url, safe='')}&output=json"
+    q = (f"{CDX}?url={quote(url, safe='/:')}&output=json"
         f"&fl=timestamp,original,statuscode,mimetype,length&collapse=digest&limit={limit}")
     if year_from:
         q += f"&from={year_from}"
@@ -51,7 +53,7 @@ async def snapshots(url: str, limit: int = 20, year_from: int | None = None, yea
 async def closest(url: str, timestamp: str = "") -> str | None:
     """Replay URL of the snapshot closest to timestamp (YYYYMMDDhhmmss..., default now), or None
     if archive.org has never captured this page."""
-    q = f"{AVAILABLE}?url={quote(url, safe='')}"
+    q = f"{AVAILABLE}?url={quote(url, safe='/:')}"
     if timestamp:
         q += f"&timestamp={timestamp}"
     data = await _get_json(q)

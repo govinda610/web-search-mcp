@@ -5,6 +5,7 @@ import asyncio
 import heapq
 import html as htmllib
 import itertools
+import json
 import re
 import time
 import zlib
@@ -17,6 +18,8 @@ ASSETS = re.compile(r"\.(css|js|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|xml|json|w
 GZIP_CAP = 50 * 1024 * 1024  # never inflate a sitemap past this, in case it's a gzip bomb
 CRAWL_DEADLINE = 120  # seconds for a whole crawl() call
 CRAWL_CONCURRENCY = 4
+CC_COLLINFO = "https://index.commoncrawl.org/collinfo.json"
+CC_MIN_LINKS = 5  # try Common Crawl only when the site has no sitemap and its front page links to almost nothing
 
 
 def _gunzip(data: bytes) -> bytes | None:
@@ -81,6 +84,34 @@ async def _from_links(url: str, limit: int, keep) -> list[str]:
     return links[:limit]
 
 
+async def _from_common_crawl(host: str, limit: int, keep) -> list[str]:
+    """Common Crawl's URL index as a last resort when a site has no sitemap and its front page
+    links to almost nothing (a JS app shell, a single-page site, ...). Tolerates CC being down --
+    _get() already swallows request failures and returns None."""
+    collinfo = await _get(CC_COLLINFO)
+    if not collinfo:
+        return []
+    try:
+        cdx_api = json.loads(collinfo)[0]["cdx-api"]  # collections are listed newest first
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return []
+    body = await _get(f"{cdx_api}?url={host}/*&output=json&fl=url&filter=status:200&limit={limit * 3}")
+    if not body:
+        return []
+    seen, pages = set(), []
+    for line in body.decode("utf-8", errors="replace").splitlines():  # one JSON object per line
+        try:
+            u = json.loads(line)["url"]
+        except (json.JSONDecodeError, KeyError):
+            continue
+        if keep(u) and u not in seen:
+            seen.add(u)
+            pages.append(u)
+            if len(pages) >= limit:
+                break
+    return pages
+
+
 async def site_map(url: str, limit: int = 200, path_filter: str = "") -> str:
     if "//" not in url:
         url = "https://" + url
@@ -97,8 +128,13 @@ async def site_map(url: str, limit: int = 200, path_filter: str = "") -> str:
         return (f"{len(pages)} pages of {root} from {len(used)} sitemap file(s)"
                 + (f" matching {path_filter!r}" if path_filter else "") + ":\n" + "\n".join(pages))
     links = await asyncio.wait_for(_from_links(url, limit, keep), 30)
-    return (f"{root} publishes no sitemap; {len(links)} same-site links found on {url}"
-            + (f" matching {path_filter!r}" if path_filter else "") + ":\n" + "\n".join(links))
+    extra = 0
+    if len(links) < CC_MIN_LINKS:
+        cc_pages = [p for p in await _from_common_crawl(parsed.hostname, limit, keep) if p not in links]
+        links, extra = links + cc_pages, len(cc_pages)
+    note = f", plus {extra} from Common Crawl" if extra else ""
+    return (f"{root} publishes no sitemap; {len(links)} same-site links found on {url}{note}"
+            + (f" matching {path_filter!r}" if path_filter else "") + ":\n" + "\n".join(links[:limit]))
 
 
 _LINK_RE = re.compile(r'<a\s[^>]*?href=["\']([^"\'#]+)["\'][^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)

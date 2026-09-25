@@ -24,6 +24,7 @@ import pymupdf
 import trafilatura
 from curl_cffi import AsyncSession
 
+import index
 from store import STATE
 
 CACHE = STATE / "cache"
@@ -45,6 +46,7 @@ CHALLENGE_MARKERS = (
     "<title>ddos-guard",                         # DDoS-Guard JS check + manual captcha (Anna's Archive)
     "<title>error 1015",                          # Cloudflare rate limit
     "<title>sci-hub: are you are robot",         # Sci-Hub captcha
+    "<title>making sure you",                    # Anubis proof-of-work (HAL, many open-source sites)
 )
 RETRYABLE = (401, 403, 429, 503)  # statuses a stealthier fetcher may get past
 BROWSER_SLOTS = asyncio.Semaphore(2)  # each Camoufox instance is a full browser
@@ -310,28 +312,55 @@ async def _chrome_cdp(url: str, timeout: int, proxy: str | None = None, deadline
 
 STAGES = [("curl_cffi", _curl_cffi), ("camoufox", _camoufox), ("chrome_cdp", _chrome_cdp),
           ("camoufox_visible", _camoufox_visible), ("jina", _jina)]
+# method= forces a single stage (or pair) instead of the full escalation chain.
+METHOD_STAGES = {
+    "plain": [("curl_cffi", _curl_cffi)],
+    "tor": [("curl_cffi", _curl_cffi)],
+    "browser": [("camoufox", _camoufox), ("camoufox_visible", _camoufox_visible)],
+    "chrome": [("chrome_cdp", _chrome_cdp)],
+}
+METHODS = ("auto", "plain", "browser", "chrome", "tor", "archive")
 
 
 async def fetch(url: str, timeout: int = 15, interactive: bool = True, on_stage=None,
-                deadline: float = FETCH_TOTAL_DEADLINE) -> Page:
+                deadline: float = FETCH_TOTAL_DEADLINE, method: str = "auto") -> Page:
     """Run the stage chain; if the site is unreachable directly, run it again through Tor. If every
-    live stage fails (dead page, hard block), fall back to the closest Wayback Machine snapshot.
+    live stage fails, or succeeds but the page is an obvious paywall stub, fall back to an archived
+    copy (archive.today, then the closest Wayback Machine snapshot).
+    method picks a single stage instead of the chain, and skips the archive fallback on failure:
+    plain (curl_cffi only), browser (camoufox, visible window if it's still blocked), chrome (your
+    own Chrome over CDP; needs CHROME_CDP_URL), tor (curl_cffi via Tor), archive (skip live
+    fetching, read only the archived copy). auto (default) is the chain described above.
     interactive=False never opens a visible window (for batch reads nobody is watching).
     on_stage(name) is awaited before each stage, for progress reporting.
     deadline is the wall-clock budget in seconds for the whole chain (direct + Tor retry); the
     interactive visible-window stage only runs if enough of it remains."""
     await check_url(url)
+    if method not in METHODS:
+        raise FetchError(f"unknown method {method!r}; use one of {', '.join(METHODS)}")
+    if method == "archive":
+        page = await _paywall_fallback(url, timeout, on_stage)
+        if page:
+            return page
+        raise FetchError("no archived copy found (archive.today and Wayback both failed)")
+    if method != "auto":
+        proxy = TOR if method == "tor" else None
+        return await _escalate(url, timeout, proxy, interactive, on_stage, time.monotonic() + deadline,
+                               stages=METHOD_STAGES[method])
     host = urlparse(url).hostname or ""
     end = time.monotonic() + deadline
     try:
-        return await _live_fetch(url, timeout, interactive, on_stage, end, host)
+        page = await _live_fetch(url, timeout, interactive, on_stage, end, host)
     except FetchError:
-        if on_stage:
-            await on_stage("wayback")
-        page = await archived_page(url, timeout)
+        page = await _paywall_fallback(url, timeout, on_stage)
         if page:
             return page
         raise
+    if is_paywalled(page.text):
+        better = await _paywall_fallback(url, timeout, on_stage)
+        if better:
+            return better
+    return page
 
 
 async def _live_fetch(url: str, timeout: int, interactive: bool, on_stage, end: float, host: str) -> Page:
@@ -348,6 +377,60 @@ async def _live_fetch(url: str, timeout: int, interactive: bool, on_stage, end: 
             raise FetchError(f"{direct}; via Tor: {tor}") from tor
     VIA_TOR.add(host)
     return page._replace(via=page.via + "+tor")
+
+
+# Phrases that only show up on a paywall's teaser stub, never on the article itself. Paired with
+# a short-text check so a normal page that happens to mention "subscribe" isn't misdetected.
+_PAYWALL_MARKERS = (
+    "subscribe to continue reading", "subscribe now to continue reading", "to continue reading this",
+    "to keep reading, subscribe", "you have reached your article limit", "you've reached your article limit",
+    "this article is for subscribers only", "already a subscriber? sign in",
+    "create a free account to continue reading", "sign in or subscribe to continue",
+)
+_PAYWALL_STUB_CHARS = 1200  # a real article runs longer than this; a paywall stub is one teaser paragraph
+
+
+def is_paywalled(text: str) -> bool:
+    if len(text) > _PAYWALL_STUB_CHARS:
+        return False
+    low = text.lower()
+    return any(m in low for m in _PAYWALL_MARKERS)
+
+
+# archive.today's own captcha wall (a reCAPTCHA widget), distinct from CHALLENGE_MARKERS: those
+# are matched against every site fetch() reads, and "g-recaptcha" is too common on ordinary pages
+# (contact forms, comment sections) to be a safe marker there. Confirmed by hand: /newest/<url>
+# answers curl_cffi's Chrome fingerprint directly, for both hits and a clean 404 on a miss -- but
+# a URL archive.today gets hit with often enough (a widely-shared paywalled story) can still tip
+# into this captcha instead, even for a plain GET.
+_ARCHIVE_CAPTCHA = b'id="g-recaptcha"'
+
+
+async def _archive_today(url: str, timeout: int) -> Page | None:
+    """archive.today's newest snapshot of url, via the plain redirect endpoint."""
+    try:
+        status, content_type, body = await _curl_cffi(f"https://archive.ph/newest/{url}", timeout)
+    except Exception:  # noqa: BLE001 - archive.today being unreachable isn't fetch()'s error to raise
+        return None
+    if status >= 400 or is_binary(content_type, body) or is_challenge(body) or _ARCHIVE_CAPTCHA in body:
+        return None
+    text = await asyncio.to_thread(to_text, url, content_type, body)
+    if not text.strip():
+        return None
+    return Page("archive.today", content_type, body, text)
+
+
+async def _paywall_fallback(url: str, timeout: int, on_stage=None) -> Page | None:
+    """archive.today, then the closest Wayback snapshot: whichever has a readable copy of a
+    paywalled or otherwise dead page."""
+    if on_stage:
+        await on_stage("archive.today")
+    page = await _archive_today(url, timeout)
+    if page:
+        return page
+    if on_stage:
+        await on_stage("wayback")
+    return await archived_page(url, timeout)
 
 
 async def archived_page(url: str, timeout: int, timestamp: str = "") -> Page | None:
@@ -379,10 +462,11 @@ async def archived_page(url: str, timeout: int, timestamp: str = "") -> Page | N
 
 
 async def _escalate(url: str, timeout: int, proxy: str | None, interactive: bool = True, on_stage=None,
-                    deadline: float | None = None) -> Page:
-    """Escalate through STAGES until one returns real content. Raises FetchError with every attempt."""
+                    deadline: float | None = None, stages=STAGES) -> Page:
+    """Escalate through stages (default STAGES; method= passes a shorter list) until one returns
+    real content. Raises FetchError with every attempt."""
     attempts = []
-    for name, stage in STAGES:
+    for name, stage in stages:
         if name == "camoufox_visible" and not interactive:
             continue
         if deadline is not None:
@@ -426,10 +510,17 @@ def _cache_file(url: str) -> Path:
     return CACHE / (hashlib.md5(url.encode()).hexdigest() + ".txt")
 
 
-def cache_get(url: str) -> str | None:
+def cache_get(url: str, max_age: int | None = None) -> str | None:
+    """The cached text if it's younger than max_age seconds (default: CACHE_TTL). The file's own
+    mtime is the fetch time, so no separate timestamp needs storing. max_age=0 never returns a hit.
+    A cache entry never lives past CACHE_TTL regardless of max_age (cache_put prunes on that
+    schedule), so max_age only usefully narrows the window, not widens it."""
+    age = CACHE_TTL if max_age is None else max_age
+    if age <= 0:
+        return None
     f = _cache_file(url)
     try:
-        if time.time() - f.stat().st_mtime < CACHE_TTL:
+        if time.time() - f.stat().st_mtime < age:
             return f.read_text()
     except FileNotFoundError:
         pass  # another call's cache_put pruned it, or it never existed
@@ -450,15 +541,17 @@ def cache_put(url: str, text: str) -> None:
                 old.unlink(missing_ok=True)
         _last_prune = now
     _cache_file(url).write_text(text)
+    index.add_page(url, text)
 
 
-async def fetch_text(url: str, timeout: int = 15, fresh: bool = False, interactive: bool = True,
-                     on_stage=None, deadline: float = FETCH_TOTAL_DEADLINE) -> tuple[str, str]:
-    """(via, text), served from cache when fresh unless fresh=True."""
-    cached = None if fresh else cache_get(url)
+async def fetch_text(url: str, timeout: int = 15, max_age: int | None = None, interactive: bool = True,
+                     on_stage=None, deadline: float = FETCH_TOTAL_DEADLINE, method: str = "auto") -> tuple[str, str]:
+    """(via, text). max_age: None uses the default 1h cache, 0 always fetches live, N accepts a
+    cached copy up to N seconds old. method picks which stage(s) fetch() uses; see fetch()."""
+    cached = cache_get(url, max_age)
     if cached is not None:
         return "cache", cached
-    page = await fetch(url, timeout, interactive, on_stage, deadline)
+    page = await fetch(url, timeout, interactive, on_stage, deadline, method)
     cache_put(url, page.text)
     return page.via, page.text
 

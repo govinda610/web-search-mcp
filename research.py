@@ -80,11 +80,9 @@ async def _read_sources(candidates: list[dict], read: ReadFn, budget: int) -> li
     return [c for c in picked if c["text"]]
 
 
-def _degraded_report(question: str, queries: list[str], sources: list[dict], notes: dict[int, str]) -> str:
-    """No LLM was available: a citation dump instead of a synthesized report."""
-    lines = [f"# Research: {question}", "",
-             ("_No LLM was available for synthesis; below are the sub-queries used and the most "
-              "relevant passages found per source._"), "",
+def _sources_report(question: str, queries: list[str], sources: list[dict], notes: dict[int, str], why: str) -> str:
+    """The gathered sources with their notes and best passages, for when there is no report to write."""
+    lines = [f"# Research: {question}", "", f"_{why}; below are the most relevant passages found per source._", "",
              "Sub-queries used: " + ", ".join(queries), ""]
     for s in sources:
         lines.append(f"## [{s['n']}] {s['title']}")
@@ -106,20 +104,26 @@ async def deep_research(
     max_rounds: int | None = None,
     max_sources: int | None = None,
     depth: str = "standard",
+    sub_questions: list[str] | None = None,
+    report: bool = True,
 ) -> str:
     """Research `question` across several rounds and return a markdown report with [n]
     citations and a Sources list. depth picks (max_rounds, max_sources) presets
     ("standard": 2/8, ~4 min; "deep": 4/16, ~8 min); pass either explicitly to override.
-    Degrades to a citation dump (no synthesis) when ask() reports no LLM is available at all."""
+    sub_questions replaces the planning step with the caller's own queries. report=False, or no
+    LLM at all, returns the sources with notes and passages instead of a written report."""
     progress = progress or _noop_progress
     preset_rounds, preset_sources = _DEPTH_PRESETS.get(depth, _DEPTH_PRESETS["standard"])
     max_rounds = max_rounds or preset_rounds
     max_sources = max_sources or preset_sources
 
-    subqueries = await _plan_subqueries(question, ask)
-    no_llm = subqueries is None
-    if no_llm:
-        subqueries = [question]
+    subqueries = [q.strip() for q in sub_questions or [] if q.strip()][:MAX_SUBQUERIES]
+    no_llm = False
+    if not subqueries:
+        subqueries = await _plan_subqueries(question, ask)
+        no_llm = subqueries is None
+        if no_llm:
+            subqueries = [question]
 
     sources: list[dict] = []  # each: n, title, url, query, text, passages
     notes: dict[int, str] = {}
@@ -152,6 +156,9 @@ async def deep_research(
             "note (1-2 sentences) capturing what it adds. Then list up to 5 remaining gaps: "
             "specific things still unanswered, phrased as search queries (empty list if none). "
             'Reply with JSON only: {"notes": {"<n>": "..."}, "gaps": ["...", ...]}.\n\n' + batch_text, 1200)
+        if raw is None:  # the caller's sub_questions skipped planning, so this is the first sign of no LLM
+            no_llm = True
+            break
         parsed = _parse_json(raw)
         for k, v in parsed.get("notes", {}).items():
             try:
@@ -168,16 +175,18 @@ async def deep_research(
         return f"No sources could be read for: {question}\nSub-queries tried: {', '.join(used_queries)}"
     if no_llm:
         await progress(max_rounds, max_rounds, "no LLM available; compiling sources")
-        return _degraded_report(question, used_queries, sources, notes)
+        return _sources_report(question, used_queries, sources, notes, "No LLM was available for synthesis")
+    if not report:
+        return _sources_report(question, used_queries, sources, notes, "Report writing skipped (report=False)")
 
     await progress(max_rounds, max_rounds, "writing report")
     numbered_notes = "\n".join(f"[{s['n']}] {notes.get(s['n'], s['passages'][:300])}" for s in sources)
-    report = await ask(
+    written = await ask(
         f"Write a thorough research report answering: {question}\n\nUse ONLY the numbered notes "
         "below; cite claims inline as [n] matching the source number. End with a '## Sources' "
         "section listing each source as '[n] Title — URL'.\n\n" + numbered_notes, 3000)
-    if not report:
-        return _degraded_report(question, used_queries, sources, notes)
-    if "## Sources" not in report:
-        report += "\n\n## Sources\n" + _format_sources(sources)
-    return report
+    if not written:
+        return _sources_report(question, used_queries, sources, notes, "The LLM wrote no report")
+    if "## Sources" not in written:
+        written += "\n\n## Sources\n" + _format_sources(sources)
+    return written

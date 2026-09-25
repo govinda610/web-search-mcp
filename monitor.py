@@ -25,7 +25,7 @@ def _filter(text: str, query: str) -> str:
 async def check(url: str, query: str = "") -> str:
     """First call for a URL stores a baseline; later calls return a unified diff against it,
     or "unchanged since ..." when nothing changed."""
-    _via, text = await fetch.fetch_text(url, timeout=15, fresh=True, interactive=False)
+    _via, text = await fetch.fetch_text(url, timeout=15, max_age=0, interactive=False)
     if query:
         text = _filter(text, query)
     pages = load_json(PAGES)
