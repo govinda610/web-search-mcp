@@ -22,6 +22,7 @@ import knowledge
 import media
 import movies
 import papers
+import torrent
 
 PAGE = Path(__file__).with_name("ui.html")
 HEADER = ("x-requested-with", "web-search-ui")
@@ -197,7 +198,7 @@ def register(mcp, env: dict, fetch_page, media_download, book_download) -> None:
         return {"searxng": engines, "papers": [f.__name__ for f in papers.EXTRA_SOURCES],
                 "knowledge": {"all": list(knowledge.SOURCES), "default": knowledge.DEFAULT},
                 "media": {cat: [f.__name__ for f in fns] for cat, fns in media.SOURCES.items()},
-                "catalogs": sorted(media.CATALOGS),
+                "catalogs": sorted(media.CATALOGS), "trackers": torrent.TRACKERS,
                 "skipped": {n: int(health.skipped(n)) for n in names if health.skipped(n)}}
 
 

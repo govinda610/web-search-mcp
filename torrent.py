@@ -5,11 +5,29 @@ import asyncio
 import shutil
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import media
 
 ARIA2C = shutil.which("aria2c")
 STALL_SECONDS = 300  # give up when nothing has arrived for this long (dead torrent, no seeders)
+# media.search() returns bare magnets (hash and name) to keep results short. With no trackers,
+# peers can only come from DHT, which starts empty, so a healthy torrent can sit at 0 peers.
+# These are long-running public trackers; download() adds them, and so does the page's Copy magnet.
+TRACKERS = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://tracker.dler.org:6969/announce",
+]
+DHT_BOOTSTRAP = "router.bittorrent.com:6881"
+
+
+def with_trackers(magnet: str) -> str:
+    """The magnet plus any of TRACKERS it doesn't already list."""
+    return magnet + "".join(f"&tr={quote(t, safe='')}" for t in TRACKERS if quote(t, safe="") not in magnet)
 
 
 async def download(magnet: str, folder: str, on_progress=None,
@@ -25,8 +43,8 @@ async def download(magnet: str, folder: str, on_progress=None,
     dest = Path(folder).expanduser()
     dest.mkdir(parents=True, exist_ok=True)
     started = time.time()
-    args = [ARIA2C, magnet, "--dir", str(dest), "--summary-interval=2", "--console-log-level=warn",
-            f"--bt-stop-timeout={STALL_SECONDS}"]
+    args = [ARIA2C, with_trackers(magnet), "--dir", str(dest), "--summary-interval=2",
+            "--console-log-level=warn", f"--bt-stop-timeout={STALL_SECONDS}", f"--dht-entry-point={DHT_BOOTSTRAP}"]
     if not seed:
         args.append("--seed-time=0")
     proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,

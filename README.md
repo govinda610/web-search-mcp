@@ -26,7 +26,7 @@ are optional fallbacks, used only when local search fails, and every one is quot
 | `social_fetch(target, num_results, sort)` | Public posts and profiles without login. Reddit posts + comments via the Arctic Shift archive and subreddit feeds (`r/name`) via throttled RSS, ban-safe; X/Twitter (fxtwitter, X embed API), Bluesky, Telegram channels, Instagram |
 | `media_search(query, category, num_results, sites)` | Books, comics, manga/manhwa, anime, movies, TV/K-drama, games, audiobooks, music, podcasts, software, subtitles. Parallel across sources; returns what the title is and where to get it (magnets with seeders, md5s, direct downloads) |
 | `book_download(md5, save_dir)` | Downloads a book/comic/paper by md5: LibGen, then Z-Library with a free account |
-| `media_download(url, format, max_height, save_dir, playlist, subtitles)` | Video or audio from YouTube and ~1800 other sites (yt-dlp + ffmpeg): mp4 (H.264, plays everywhere), mkv, webm, or audio only as mp3, m4a, opus, flac, wav. Resolution cap, playlists (first 50 items), embedded English subtitles, progress notifications. A magnet link from `media_search` downloads the torrent with aria2c, without seeding afterwards; one that stalls for 5 minutes is abandoned |
+| `media_download(url, format, max_height, save_dir, playlist, subtitles)` | Video or audio from YouTube and ~1800 other sites (yt-dlp + ffmpeg): mp4 (H.264, plays everywhere), mkv, webm, or audio only as mp3, m4a, opus, flac, wav. Resolution cap, playlists (first 50 items), embedded English subtitles, progress notifications. A magnet link from `media_search` downloads the torrent with aria2c, adding public trackers so peers are found, without seeding afterwards; one that stalls for 5 minutes is abandoned |
 | `release_watch(action, query, category, min_quality)` | Watches for a movie/show/anime release at or above a quality (`WEB-DL` by default, so cam copies don't count) and sends a macOS notification when one appears. Checked every `WATCH_INTERVAL_HOURS` (6) by the HTTP server, or on `action="check"` |
 | `deep_research(question, depth, sub_questions, report)` | Multi-round research: plans sub-queries (or takes yours in `sub_questions`), searches, reads the best pages, notes gaps, searches again, then writes a report citing every claim as [n]. `report=False` returns the sources and their best passages without the write-up, for an agent that writes its own. `standard` ~4 min / 8 sources, `deep` ~8 min / 16 |
 | `server_status(check_new_sources)` | Monthly usage per search provider, LLM call counts, current working mirror per site, sources skipped after repeated failures. `check_new_sources`: what's new or moved in Prowlarr's indexer list and FMHY's starred sites since the last check |
@@ -219,9 +219,14 @@ returned on its own, as each one finishes, next to the merged list.
   year-less and alternate-title searches as buttons.
 - **Filter and sort** without searching again: text, minimum seeders, resolution, hide cinema
   recordings or flagged results; sort by seeders, size, date or title.
-- **Actions.** Read a page or PDF as clean text (same fetching as `fetch_page`), copy a magnet,
+- **Actions.** Read a page or PDF as clean text (same fetching as `fetch_page`), copy a magnet
+  (with public trackers added, so any torrent client finds peers),
   download a torrent, book or video/audio (same as the download tools), with progress.
 - Searches go into the address bar, so back/forward and bookmarks work; `/` focuses the search box.
+- **A site that won't open** (The Pirate Bay, 1337x, LimeTorrents…) is usually blocked by your
+  ISP's DNS, which the server gets around via Tor but your browser doesn't. Use Read to see the
+  page through the server, or turn on encrypted DNS: Chrome → Settings → Privacy and security →
+  Use secure DNS → Cloudflare (1.1.1.1).
 
 It answers only as `127.0.0.1`/`localhost`, and its API calls need a header a cross-site page
 can't send without a CORS preflight, which these routes never answer, so a web page you visit

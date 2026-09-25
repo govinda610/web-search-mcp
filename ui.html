@@ -91,6 +91,8 @@ const TABS = { web: "Web", papers: "Papers", knowledge: "Knowledge", media: "Med
 const SXNG_CATS = ["general", "news", "images", "videos", "science", "it", "files", "music", "social media"];
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+// search results carry bare magnets; a torrent client finds peers much faster with trackers in them
+const withTrackers = m => m + (SOURCES?.trackers || []).filter(t => !m.includes(encodeURIComponent(t))).map(t => "&tr=" + encodeURIComponent(t)).join("");
 const safeUrl = u => /^(https?:|magnet:)/i.test(u || "") ? u : "";
 const store = { get: (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
                 set: (k, v) => localStorage.setItem(k, JSON.stringify(v)) };
@@ -219,7 +221,7 @@ function card(r, showSource = true) {
     url ? `<button data-open="${esc(url)}">Open</button>` : "",
     /^https?:/.test(url) ? `<button data-read="${esc(url)}">Read</button>` : "",
     safeUrl(r.pdf) ? `<button data-read="${esc(r.pdf)}">Read PDF</button>` : "",
-    r.magnet ? `<button data-copy="${esc(r.magnet)}">Copy magnet</button><button data-dl="${esc(r.magnet)}" data-label="${esc(r.title)}">Download</button>` : "",
+    r.magnet ? `<button data-copy="${esc(withTrackers(r.magnet))}">Copy magnet</button><button data-dl="${esc(r.magnet)}" data-label="${esc(r.title)}">Download</button>` : "",
     r.md5 ? `<button data-md5="${esc(r.md5)}" data-label="${esc(r.title)}">Download book</button>` : "",
     safeUrl(r.download) ? `<button data-open="${esc(r.download)}">Download page</button>` : "",
     state.tab === "web" && ["videos", "music"].includes(state.category) && url
