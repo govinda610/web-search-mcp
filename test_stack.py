@@ -27,6 +27,7 @@ os.environ["WEB_MCP_STATE_DIR"] = str(_TEST_STATE)
 import crawl  # noqa: E402
 import discover  # noqa: E402
 import fetch  # noqa: E402
+import index  # noqa: E402
 import llm  # noqa: E402
 import media  # noqa: E402
 import mirrors  # noqa: E402
@@ -40,6 +41,7 @@ import research  # noqa: E402
 import server  # noqa: E402
 import social  # noqa: E402
 import sources  # noqa: E402
+import torrent  # noqa: E402
 import watch  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 
@@ -93,6 +95,16 @@ async def unit_tests():
        and server._url_key("https://a.com/p?id=1") != server._url_key("https://a.com/p?id=2"))
     ok("logic: interleave takes each run's best first",
        [r["url"] for r in server._interleave([[{"url": "a"}, {"url": "b"}], [{"url": "c"}]], 3)] == ["a", "c", "b"])
+    twins = [{"url": "https://x.com/rust-async", "title": "Rust async", "snippet": "Tokio vs smol."},
+             {"url": "https://x.com/rust_async", "title": "Rust  Async", "snippet": "Tokio vs smol"},
+             {"url": "https://y.com/home", "title": "Home", "snippet": ""},
+             {"url": "https://z.com/home", "title": "Home", "snippet": ""}]
+    ok("logic: interleave drops same title+snippet, keeps bare same titles",
+       [r["url"] for r in server._interleave([twins], 9)] == [twins[0]["url"], twins[2]["url"], twins[3]["url"]])
+    ok("logic: snippets cut at a word", server._short("word " * 100).endswith("word…"))
+    schema = next(t for t in server.mcp._tool_manager.list_tools() if t.name == "web_search").parameters
+    ok("logic: schemas slimmed", "title" not in schema["properties"]["query"]
+       and "anyOf" not in schema["properties"]["include_domains"])
     ok("logic: recency searxng", server._recency_opts("searxng", "week") == {"time_range": "week"})
     ok("logic: recency firecrawl", server._recency_opts("firecrawl", "day") == {"tbs": "qdr:d"})
     ok("logic: recency duckduckgo", server._recency_opts("duckduckgo", "month") == {"df": "m"})
@@ -152,7 +164,11 @@ async def unit_tests():
 
 async def search_tests():
     r = await server.web_search("valheim 1.0 seeds", 5)
-    ok("search: fallback", r.startswith("[searxng]"), r[:50])
+    ok("search: fallback, numbered, untagged", r.startswith("1. ") and "[searxng]" not in r, r[:50])
+    r = await server.web_search("rust async runtime", 10, max_chars=1000)
+    ok("search: max_chars budget", len(r) < 1600 and "more results omitted" in r, r[-120:])
+    r = await server.web_search("best mobile plan", 5, language="en-IN")
+    ok("search: region code", r.count(".in/") + r.count(".in\n") >= 1, r[:200])
     r = await server.web_search("valheim 1.0 seeds", 3, more_queries=["valheim ashlands boss"])
     ok("search: parallel queries tagged", "(q: valheim ashlands boss)" in r, r[:60])
     r = await server.web_search("python asyncio gather", 3, depth="advanced")
@@ -171,11 +187,11 @@ async def search_tests():
     ok("search: filetype", urls and sum(".pdf" in u or "/pdf/" in u for u in urls) >= len(urls) // 2, urls[:2])
     p1 = await server.web_search("valheim seeds", 5)
     p2 = await server.web_search("valheim seeds", 5, page=2)
-    ok("search: page 2 differs", p2 != p1 and p2.startswith("[searxng]"), p2[:50])
+    ok("search: page 2 differs", p2 != p1 and p2.startswith("1. "), p2[:50])
     r = await server.web_search("openai news", 4, recency="week")
     ok("search: recency", len(r) > 50 and "[jina]" not in r, r[:50])
-    r = await server.news_search("claude anthropic", 3, "month")
-    ok("search: news_search", r.startswith("(via"), r[:50])
+    r = await server.news_search("claude anthropic", 5, "month")
+    ok("search: news_search, real article links", "\n  https://" in r and "news.google.com" not in r, r[:120])
     r = await server.knowledge_search("mixture of experts", None, 2)
     ok("search: knowledge default sources", all(f"{s}: 2" in r for s in ("wikipedia", "github", "openreview")), r[:110])
     r = await server.knowledge_search("pandas merge", ["stackoverflow", "packages", "huggingface_models", "lemmy"], 2)
@@ -208,6 +224,13 @@ async def paper_tests():
     ok("papers: fetch via arXiv DOI", "arXiv 1706.03762" in r, r[:60])
     url, note = await papers.resolve("10.1371/journal.pone.0000308", 15)
     ok("papers: DOI -> open-access url", url.startswith("http") and "open-access" in note, note)
+    r = await papers.crossref("sparse autoencoders interpretability", 5, 20)
+    ok("papers: crossref returns DOIs", r and all(e["doi"] for e in r), [e["title"][:40] for e in r[:2]])
+    r = await papers.biorxiv_medrxiv("single cell RNA sequencing", 3, 20)
+    ok("papers: bioRxiv/medRxiv preprints", r and all(e["venue"].lower() in ("biorxiv", "medrxiv") for e in r),
+       [e["venue"] for e in r])
+    r = await outcome(papers._libgen_scimag("10.1038/nature14539", 30))
+    ok("papers: paywalled DOI -> LibGen PDF (or clear outage)", r.startswith("http") or "Error" in r, r[:80])
 
 
 async def fetch_tests():
@@ -274,6 +297,30 @@ async def fetch_tests():
     ok("fetch: page_history lists snapshots (or clear outage)", "web.archive.org/web/" in r or "archive.org" in r, r[:80])
     r = await outcome(server.fetch_page("https://example.com", as_of="2010"))
     ok("fetch: as_of reads an old snapshot (or clear outage)", "(via wayback (snapshot 20" in r or "archive" in r.lower(), r[:80])
+    # per-call cache age, forced stages, paywall stubs, the page index, find-similar
+    url = "https://example.com/max-age-check"
+    fetch.cache_put(url, "cached text")
+    os.utime(fetch._cache_file(url), (time.time() - 500, time.time() - 500))
+    ok("fetch: max_age narrows the cache window", fetch.cache_get(url) == "cached text"
+       and fetch.cache_get(url, 100) is None and fetch.cache_get(url, 0) is None)
+    r = await server.fetch_page("https://example.com", max_age=0, method="plain")
+    ok("fetch: max_age=0 + method=plain fetch live", r.startswith("(via curl_cffi)"), r[:40])
+    r = await outcome(fetch.fetch("https://example.com", method="chrome"))
+    ok("fetch: method=chrome without CDP fails clearly", "CHROME_CDP_URL" in r or r.startswith("Page("), r[:80])
+    r = await outcome(server.fetch_page("https://en.wikipedia.org/wiki/Paywall", max_chars=300, method="archive"))
+    ok("fetch: method=archive (or clear outage)", "(via archive.today)" in r or "(via wayback" in r
+       or "no archived copy" in r, r[:80])
+    ok("fetch: paywall stub detected, articles not",
+       fetch.is_paywalled("Subscribe now to continue reading this story.")
+       and not fetch.is_paywalled("subscribe to continue reading. " + "word " * 400))
+    ok("index: FTS operators in queries are plain words",
+       all(isinstance(index.search(q), list) for q in ('a" OR 1=1--', "AND OR NOT *", '"x', "site:x", "", "()")))
+    r = await server.knowledge_search("example domain", sites=["history"])
+    ok("index: history finds a page read earlier", "== history ==" in r and "example.com" in r, r[:80])
+    r = await server.web_search("rust async runtimes", 5, similar_to="https://tokio.rs/")
+    ok("search: similar_to finds other sites", r.startswith("1. ") and "tokio.rs/" not in r, r[:80])
+    r = await outcome(server.site_map("http://info.cern.ch", 20))
+    ok("fetch: site_map Common Crawl fallback (or clear outage)", "Common Crawl" in r or "no sitemap" in r, r[:80])
 
 
 async def reddit_tests():
@@ -403,6 +450,20 @@ async def _check_deep_research_fakes(ok):
     ok("deep_research: degrades cleanly when ask() returns None (no LLM)",
        "No LLM was available" in degraded and "## Sources" in degraded)
 
+    searched = []
+
+    async def search_logged(query, n):
+        searched.append(query)
+        return await search(query, n)
+
+    notes_only = await research.deep_research("test question", search_logged, read, ask, depth="standard",
+                                              sub_questions=["mine a", "mine b"], report=False)
+    ok("deep_research: uses the caller's sub_questions", searched[:2] == ["mine a", "mine b"], searched)
+    ok("deep_research: report=False returns sources, no report",
+       "report=False" in notes_only and "Report body" not in notes_only and "## Sources" in notes_only)
+    no_llm = await research.deep_research("test question", search, read, ask_none, sub_questions=["mine a"])
+    ok("deep_research: sub_questions without an LLM still says so", "No LLM was available" in no_llm)
+
     async def search_empty(query, n):
         return []
 
@@ -424,10 +485,6 @@ async def research_tests():
 async def llm_tests():
     r = await server.web_search("who won nobel physics 2025", 5, answer=True)
     ok("llm: answer synthesis", "ANSWER" in r, r[:60])
-    r = await server.web_search("best programming language 2026", 5, highlights=True)
-    ok("llm: highlights", "HIGHLIGHTS" in r, r[:60])
-    spec = await server._auto_classify("tesla stock news this week")
-    ok("llm: auto classify returns a spec", spec.get("news") is True or spec.get("strategy"), spec)
 
 
 async def degradation_tests():
@@ -439,10 +496,10 @@ async def degradation_tests():
         r = str(e)
     server.ENV["SEARXNG_URL"] = orig
     ok("degrade: searxng down -> next provider or clear error",
-       "[searxng]" not in r and ("\n  http" in r or "searxng:" in r), r[:60])
+       "\n  http" in r or "searxng:" in r, r[:60])
     op = llm._providers
     llm._providers = lambda: []
-    r = await server.web_search("valheim seeds", 3, answer=True, highlights=True, auto=True)
+    r = await server.web_search("valheim seeds", 3, answer=True)
     llm._providers = op
     ok("degrade: llm down -> plain results", "ANSWER" not in r and "\n  http" in r, r[:60])
     saved = dict(providers.REGISTRY)
@@ -527,6 +584,17 @@ async def media_quality_tests():
     ok("classify: password lure flagged", any("password" in w for w in q["warnings"]), q)
 
     ok("classify: empty title doesn't crash", quality.classify("") == quality.classify(""))
+
+    # --- fuzzy dedupe, magnet downloads ------------------------------------
+    dupes = [{"source": "knaben", "title": "Dune.Part.Two.2024.1080p.WEB-DL", "hash": "a" * 40, "seeders": 50, "year": "2024"},
+             {"source": "piratebay", "title": "Dune Part Two 2024 1080p WEB-DL", "hash": "b" * 40, "seeders": 90, "year": "2024"},
+             {"source": "eztv", "title": "Show S01E01 1080p WEB-DL", "hash": "c" * 40, "seeders": 5, "year": ""},
+             {"source": "eztv", "title": "Show S01E02 1080p WEB-DL", "hash": "d" * 40, "seeders": 5, "year": ""}]
+    kept = media.dedupe_similar(dupes)
+    ok("media: fuzzy dedupe keeps best seeded, not other episodes", len(kept) == 3
+       and any(k["source"] == "piratebay" and "also on knaben" in k.get("info", "") for k in kept), kept)
+    r = await outcome(torrent.download("magnet:?xt=urn:btih:" + "0" * 40, tempfile.mkdtemp(), timeout=5))
+    ok("media: dead magnet fails clearly", "timed out" in r or "aria2c not found" in r, r[:80])
 
     # --- media._size_bytes --------------------------------------------------
     ok("_size_bytes: round-trips _size", media._size_bytes(media._size(3 * 1024**3)) == 3 * 1024**3)
@@ -693,7 +761,7 @@ async def data_tests():
     monitor_pages = ["Title\n\nParagraph one about cats.\n\nParagraph two about dogs.",
                      "Title\n\nParagraph one about cats and kittens.\n\nParagraph two about dogs."]
 
-    async def fake_fetch_text(url, timeout=15, fresh=False, interactive=True, on_stage=None):
+    async def fake_fetch_text(url, timeout=15, max_age=None, interactive=True, on_stage=None, method="auto"):
         text = monitor_pages[min(calls["n"], len(monitor_pages) - 1)]
         calls["n"] += 1
         return "live", text
@@ -759,6 +827,17 @@ async def data_tests():
         ok("datasets.news_trends returns GDELT data", "articles" in news.lower(), news[:150])
     except Exception as e:  # noqa: BLE001 - live network check; GDELT rate-limits aggressively
         ok("datasets.news_trends returns GDELT data", False, str(e))
+    for sites, want in [(["clinicaltrials"], "clinicaltrials.gov/study/"), (["openfda"], "dailymed"),
+                        (["courtlistener"], "courtlistener.com"), (["code"], "github.com/"),
+                        (["wiktionary"], "wiktionary.org")]:
+        query = {"clinicaltrials": "diabetes", "openfda": "ibuprofen", "courtlistener": "miranda",
+                 "code": "asyncio.TaskGroup", "wiktionary": "serendipity"}[sites[0]]
+        r = await outcome(server.knowledge_search(query, sites, 2))
+        ok(f"knowledge: {sites[0]}", want in r.lower(), r[:120])
+    r = await outcome(server.knowledge_search("battery", ["patents"], 2))
+    ok("knowledge: patents without a key skips cleanly", "patents: 0" in r or "patents.google.com" in r, r[:120])
+    r = await outcome(server.live_data("economy", "India GDP growth"))
+    ok("live_data: economy (World Bank)", "World Bank" in r and "India" in r, r[:120])
     r = await server.page_watch("list")
     ok("page_watch: list works", "No pages" in r or "last checked" in r, r[:80])
     ok("page_watch: check needs a url", "needs a url" in await err(server.page_watch("check")))

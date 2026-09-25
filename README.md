@@ -9,16 +9,16 @@ are optional fallbacks, used only when local search fails, and every one is quot
 
 | Tool | What it does |
 |---|---|
-| `web_search(query, num_results, strategy, include_domains, exclude_domains, recency, depth, more_queries, filetype, page, language, safesearch, answer, highlights, auto)` | `fallback` (local first) / `merge` / `exhaustive` (all providers parallel, interleaved, deduped). Domain lists, recency, file type, result page, language and safe-search filters. `more_queries`: up to 9 extra phrasings run in parallel. `depth="advanced"`: reads the top 5 pages and adds their most relevant passages. `answer`: LLM synthesis with [n] citations. `highlights`: key-fact bullets. `auto`: LLM picks strategy/recency/news routing. Results show publish dates when known |
-| `news_search(query, num_results, recency, trends)` | Recent news via SearXNG news vertical, Tavily as fallback. `trends`: daily coverage volume plus articles from GDELT |
+| `web_search(query, num_results, strategy, include_domains, exclude_domains, recency, depth, more_queries, filetype, page, language, safesearch, max_chars, answer, similar_to)` | `fallback` (local first) / `merge` / `exhaustive` (all providers parallel, interleaved, deduped by URL and by title + snippet). Domain lists, recency, file type, result page, language or region (`en-IN`) and safe-search filters. `more_queries`: up to 9 extra phrasings run in parallel. `depth="advanced"`: reads the top 5 pages and adds their most relevant passages. `max_chars`: output budget; results past it are counted, not shown. `answer`: LLM synthesis with [n] citations. `similar_to`: pages like a given URL, from other sites (its title and key terms searched, reranked against its opening text). Results are numbered, with publish dates when known |
+| `news_search(query, num_results, recency, trends)` | Recent news from SearXNG's news engines and Google News in parallel (Google's redirect links resolved to the publisher's URL), Tavily as fallback. `trends`: daily coverage volume plus articles from GDELT |
 | `image_search(query, num_results)` | Image results via SearXNG image vertical |
-| `knowledge_search(query, sites, num_results)` | Straight from the sources' own APIs, in parallel: Wikipedia, Hacker News, Stack Overflow, GitHub repos, OpenReview, Hugging Face papers and models, Lemmy, Wikidata (structured facts), packages (npm, crates.io, PyPI) |
-| `live_data(kind, query)` | Stock quotes incl. NSE/BSE (Yahoo Finance), exchange rates (ECB via Frankfurter), crypto (CoinGecko), weather + 4-day forecast (Open-Meteo), places (`cafe near Koramangala, Bangalore`, OpenStreetMap), SEC filings (`AAPL 10-K`, EDGAR, needs `SEC_USER_AGENT`) |
-| `paper_search(query, num_results, year_from, year_to)` | Papers from arXiv, Semantic Scholar, Google Scholar, PubMed, EuropePMC, OpenAIRE (via SearXNG): authors, venue, citations, DOI, PDF link |
-| `paper_fetch(ref, save_dir, max_chars, start)` | arXiv id / DOI / URL → full text. DOIs resolve to open-access copies via OpenAlex, then Unpaywall. Optionally saves the PDF |
-| `fetch_page(url, max_chars, start, query, extract, fresh, as_of)` | Page or PDF → markdown. Reddit/YouTube/X/Bluesky/Telegram/Instagram auto-route. `query`: only the most relevant passages, ranked by a small local cross-encoder. `extract`: LLM pulls structured JSON. `as_of` (`2019`, `2019-06`, `2019-06-01`): the Wayback Machine copy closest to that date. Long documents are paged with `start` |
-| `fetch_pages(urls, max_chars, query, concurrency)` | Up to 20 pages concurrently; a failed page shows why without sinking the batch |
-| `site_map(url, num_results, path_filter)` | A site's pages from its sitemaps (robots.txt, sitemap.xml, nested indexes, .gz), or its front-page links when it has none |
+| `knowledge_search(query, sites, num_results)` | Straight from the sources' own APIs, in parallel: Wikipedia, Hacker News, Stack Overflow, GitHub repos, OpenReview, Hugging Face papers and models, Lemmy, Wikidata (structured facts), packages (npm, crates.io, PyPI), code (grep.app, across ~1M GitHub repos), Wiktionary, ClinicalTrials.gov, openFDA drug labels, CourtListener (US case law), US patents (needs `USPTO_ODP_API_KEY`), and `history`: every page this server has fetched, from a local SQLite full-text index |
+| `live_data(kind, query)` | Stock quotes incl. NSE/BSE (Yahoo Finance), exchange rates (ECB via Frankfurter), crypto (CoinGecko), weather + 4-day forecast (Open-Meteo), economic indicators (`India GDP growth`, `US inflation`; World Bank, or any FRED series with `FRED_API_KEY`), places (`cafe near Koramangala, Bangalore`, OpenStreetMap), SEC filings (`AAPL 10-K`, EDGAR, needs `SEC_USER_AGENT`) |
+| `paper_search(query, num_results, year_from, year_to)` | Papers from arXiv, Semantic Scholar, Google Scholar, PubMed, EuropePMC, OpenAIRE (via SearXNG), plus Crossref, bioRxiv/medRxiv and CORE (with `CORE_API_KEY`) in parallel, merged by title: authors, venue, citations, DOI, PDF link |
+| `paper_fetch(ref, save_dir, max_chars, start)` | arXiv id / DOI / URL → full text. DOIs resolve to open-access copies via OpenAlex, then Unpaywall, then Anna's Archive SciDB and LibGen. Optionally saves the PDF |
+| `fetch_page(url, max_chars, start, query, extract, max_age, method, as_of)` | Page or PDF → markdown. Reddit/YouTube/X/Bluesky/Telegram/Instagram auto-route. `query`: only the most relevant passages, ranked by a small local cross-encoder. `extract`: LLM pulls structured JSON. `max_age`: oldest cached copy to accept in seconds (`0` = live). `method`: force one stage (`plain`, `browser`, `chrome`, `tor`, `archive`). `as_of` (`2019`, `2019-06`, `2019-06-01`): the Wayback Machine copy closest to that date. Long documents are paged with `start` |
+| `fetch_pages(urls, max_chars, query, extract, concurrency)` | Up to 20 pages concurrently; a failed page shows why without sinking the batch. `extract` pulls the same fields out of every page |
+| `site_map(url, num_results, path_filter)` | A site's pages from its sitemaps (robots.txt, sitemap.xml, nested indexes, .gz), or its front-page links when it has none, topped up from Common Crawl's URL index when those are few |
 | `crawl_site(url, query, num_pages, max_depth, path_filter, max_chars_each)` | Reads up to 100 pages of one site (sitemap first, then links, breadth-first, staying under the start path) and returns each page's passages most relevant to `query` |
 | `page_history(url, num_results, year_from, year_to)` | A page's Wayback Machine snapshots, newest first, one per distinct version |
 | `page_watch(action, url, query)` | `check` a page: the first call saves it, later calls show a diff of what changed. `list` and `forget` |
@@ -26,9 +26,9 @@ are optional fallbacks, used only when local search fails, and every one is quot
 | `social_fetch(target, num_results, sort)` | Public posts and profiles without login. Reddit posts + comments via the Arctic Shift archive and subreddit feeds (`r/name`) via throttled RSS, ban-safe; X/Twitter (fxtwitter, X embed API), Bluesky, Telegram channels, Instagram |
 | `media_search(query, category, num_results, sites)` | Books, comics, manga/manhwa, anime, movies, TV/K-drama, games, audiobooks, music, podcasts, software, subtitles. Parallel across sources; returns what the title is and where to get it (magnets with seeders, md5s, direct downloads) |
 | `book_download(md5, save_dir)` | Downloads a book/comic/paper by md5: LibGen, then Z-Library with a free account |
-| `media_download(url, format, max_height, save_dir, playlist, subtitles)` | Video or audio from YouTube and ~1800 other sites (yt-dlp + ffmpeg): mp4 (H.264, plays everywhere), mkv, webm, or audio only as mp3, m4a, opus, flac, wav. Resolution cap, playlists (first 50 items), embedded English subtitles, progress notifications |
+| `media_download(url, format, max_height, save_dir, playlist, subtitles)` | Video or audio from YouTube and ~1800 other sites (yt-dlp + ffmpeg): mp4 (H.264, plays everywhere), mkv, webm, or audio only as mp3, m4a, opus, flac, wav. Resolution cap, playlists (first 50 items), embedded English subtitles, progress notifications. A magnet link from `media_search` downloads the torrent with aria2c, without seeding afterwards; one that stalls for 5 minutes is abandoned |
 | `release_watch(action, query, category, min_quality)` | Watches for a movie/show/anime release at or above a quality (`WEB-DL` by default, so cam copies don't count) and sends a macOS notification when one appears. Checked every `WATCH_INTERVAL_HOURS` (6) by the HTTP server, or on `action="check"` |
-| `deep_research(question, depth)` | Multi-round research: plans sub-queries, searches, reads the best pages, notes gaps, searches again, then writes a report citing every claim as [n]. `standard` ~4 min / 8 sources, `deep` ~8 min / 16 |
+| `deep_research(question, depth, sub_questions, report)` | Multi-round research: plans sub-queries (or takes yours in `sub_questions`), searches, reads the best pages, notes gaps, searches again, then writes a report citing every claim as [n]. `report=False` returns the sources and their best passages without the write-up, for an agent that writes its own. `standard` ~4 min / 8 sources, `deep` ~8 min / 16 |
 | `server_status(check_new_sources)` | Monthly usage per search provider, LLM call counts, current working mirror per site, sources skipped after repeated failures. `check_new_sources`: what's new or moved in Prowlarr's indexer list and FMHY's starred sites since the last check |
 
 ## How fetching works
@@ -52,13 +52,20 @@ are optional fallbacks, used only when local search fails, and every one is quot
    saved to `state/browser-cookies.json` and reused by every later browser fetch, so each
    site's check is solved once. Set `FETCH_VISIBLE_BROWSER=0` to turn this stage off.
 5. **Jina reader**, only if `JINA_API_KEY` is set.
+6. **archive.today, then the Wayback Machine**, when every live stage fails or the page is a
+   paywall teaser (a short page with "subscribe to continue reading" or similar).
+
+`fetch_page(method=...)` runs one of these on its own when you know what a site needs:
+`plain` (1), `browser` (2 and 4), `chrome` (3), `tor` (1 through Tor), `archive` (6).
 
 If the connection itself fails (how an ISP block looks: timeouts, resets, DNS failures), the
 whole chain runs again through Tor and the site is remembered as Tor-only for the session.
 
 HTML → markdown with title/author/date metadata via trafilatura; PDF → text via pymupdf.
 Real 404s and unresolvable domains fail immediately instead of escalating. Challenge pages
-are never returned as content. Extracted text is cached for an hour in `state/cache/`.
+are never returned as content. Extracted text is cached for an hour in `state/cache/`
+(`max_age` narrows that per call) and added to a full-text index, `state/index.db` (SQLite
+FTS5, newest 20,000 pages), which `knowledge_search(sites=["history"])` searches offline.
 
 ## Media search
 
@@ -68,15 +75,15 @@ are never returned as content. Extracted text is cached for an hour in `state/ca
 | comics | LibGen comics, GetComics, Anna's Archive, Z-Library |
 | manga | AniList, MangaUpdates, MangaDex, WeebCentral, Nyaa, LibGen |
 | anime | AniList, SubsPlease, AnimeTosho, Nyaa, Knaben |
-| movies | IMDb (what the title is, runtime, where it's streaming), YTS, Knaben, The Pirate Bay, Torrents-CSV, LimeTorrents, Torrentio, your Prowlarr/Jackett |
-| tv | IMDb, TVmaze, MyDramaList (Kuryana), EZTV (episodes: "show s01e02"), Kisskh, Knaben, The Pirate Bay, Torrents-CSV, LimeTorrents, Torrentio, your Prowlarr/Jackett |
+| movies | IMDb (what the title is, runtime, where it's streaming), YTS, Knaben, The Pirate Bay, Torrents-CSV, LimeTorrents, 1337x, Torrentio, your Prowlarr/Jackett |
+| tv | IMDb, TVmaze, MyDramaList (Kuryana), EZTV (episodes: "show s01e02"), Kisskh, Knaben, The Pirate Bay, Torrents-CSV, LimeTorrents, 1337x, Torrentio, your Prowlarr/Jackett |
 | subtitles | OpenSubtitles |
 | audiobooks | iTunes, Internet Archive (incl. every LibriVox recording), AudioBookBay |
 | music | iTunes, Internet Archive, Knaben, LimeTorrents |
 | podcasts | iTunes |
 | games | FitGirl and Internet Archive only: games run code on your machine, so no random uploaders |
 | software | Internet Archive |
-| torrents | Knaben, The Pirate Bay, Torrents-CSV, Nyaa, LimeTorrents, your Prowlarr/Jackett |
+| torrents | Knaben, The Pirate Bay, Torrents-CSV, Nyaa, LimeTorrents, 1337x, your Prowlarr/Jackett |
 
 Each source uses the site's lightest endpoint (JSON API, RSS, or its search page): one
 request per search, at most one request per second per host, results cached for an hour.
@@ -86,11 +93,12 @@ Sites your ISP blocks are retried through Tor (`brew install tor && brew service
 **Domains that move.** Shadow libraries and trackers change domains often. `mirrors.py`
 remembers which domain last worked and tries it first. When every known domain fails, it
 refreshes the list (at most every 6 hours) from Prowlarr's indexer definitions (updated
-almost daily) or from [SLUM](https://open-slum.org), the shadow-library uptime monitor. A new
+almost daily), [SLUM](https://open-slum.org), the shadow-library uptime monitor, or
+annas-archive.info for Anna's Archive. A new
 domain is kept only if the adapter parses real results from it, so parked domains and
 look-alike clones are rejected. State lives in `state/mirrors.json`.
 
-**Quality.** Video results are tagged with a release tier (BluRay REMUX > BluRay > WEB-DL > WEBRip > HDTV/DVD > unknown > screener/telecine > telesync > cam) and sorted best first. Cinema recordings get their own section, and fakes (`.exe` files, password-protected archives, files far too small for the runtime) carry warnings. Book downloads are checked against their md5 and rejected if the server returns a login page instead.
+**Quality.** Video results are tagged with a release tier (BluRay REMUX > BluRay > WEB-DL > WEBRip > HDTV/DVD > unknown > screener/telecine > telesync > cam) and sorted best first. Cinema recordings get their own section, and fakes (`.exe` files, password-protected archives, files far too small for the runtime) carry warnings. The same release re-uploaded under a slightly different name is shown once (fuzzy title match within the same year, episode and resolution), noting which other sources carry it. A film or show search that finds nothing downloadable is retried without the year, then under an alternate title. Book downloads are checked against their md5 and rejected if the server returns a login page instead.
 
 **Your own indexers.** Set `PROWLARR_URL`/`PROWLARR_API_KEY` or `JACKETT_URL`/`JACKETT_API_KEY` and their results join movies, TV and torrent searches.
 
@@ -113,14 +121,17 @@ cp .env.example .env                      # SEARXNG_URL is the only required val
 ```
 
 SearXNG's defaults leave general search depending on DuckDuckGo alone. The example settings
-enable Google, Bing, Yahoo and Mojeek too, so one upstream throttling you doesn't take search down.
+enable Google, Bing, Yahoo, Mojeek, Yep and Mwmbl too, so one upstream throttling you doesn't
+take search down, plus Crossref, OpenAlex and Open Library for papers and books.
 
 Optional keys in `.env`: `EXA_API_KEY`, `TAVILY_API_KEY`, `FIRECRAWL_API_KEY`, `JINA_API_KEY`.
 Missing keys are skipped. Also optional: `ZLIB_EMAIL`/`ZLIB_PASSWORD` (Z-Library downloads),
 `UNPAYWALL_EMAIL` (a contact address Unpaywall asks for; finds more open-access papers), `SEC_USER_AGENT`
 (`"Your Name you@example.com"`, which EDGAR requires), `WATCH_COUNTRY` (where `media_search` checks
-legal streaming, default `IN`), `WATCH_INTERVAL_HOURS`, and the Prowlarr/Jackett pairs above.
-`media_download` needs `ffmpeg` (`brew install ffmpeg`). LLM features (`answer`/`highlights`/`auto`) read coding-plan
+legal streaming, default `IN`), `WATCH_INTERVAL_HOURS`, the Prowlarr/Jackett pairs above, and free
+keys that each switch on one source: `FRED_API_KEY`, `USPTO_ODP_API_KEY`, `COURTLISTENER_TOKEN`
+(higher rate limit only), `CORE_API_KEY`.
+`media_download` needs `ffmpeg` (`brew install ffmpeg`), and `aria2` for magnet links. LLM features (`answer`, `extract`, `deep_research`) read coding-plan
 credentials from `~/.pi/agent/models.json` (zai → qwen → minimax chain); if none respond,
 searches return plain result lists.
 
@@ -208,6 +219,16 @@ take the same URL, or the same command and args.
 ```bash
 uv run test_stack.py          # local providers only, no paid quota used
 uv run test_stack.py --paid   # also exercises the cloud providers
+```
+
+`eval.py` measures answer quality on public benchmarks, graded by an LLM judge: SimpleQA short
+facts through `web_search(answer=True)`, FRAMES multi-hop questions through `deep_research`.
+A fixed seed picks the same questions every run, so scores compare across changes; per-question
+results go to `state/eval/`.
+
+```bash
+uv run eval.py simpleqa 50
+uv run eval.py frames 20
 ```
 
 ## Design notes
