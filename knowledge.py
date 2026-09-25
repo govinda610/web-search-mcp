@@ -11,6 +11,7 @@ import re
 import time
 from urllib.parse import quote
 
+import health
 from media import http
 
 
@@ -126,21 +127,90 @@ async def packages(query: str, limit: int) -> list[dict]:
     return [r for run in runs if isinstance(run, list) for r in run]
 
 
+# property -> label, for the compact fact line rendered per wikidata entity
+_WD_CLAIMS = {"P31": "instance of", "P17": "country", "P571": "inception", "P112": "founded by",
+              "P169": "CEO", "P856": "website", "P1082": "population", "P569": "born",
+              "P570": "died", "P106": "occupation"}
+
+
+def _wd_value(claim: dict, labels: dict) -> str | None:
+    snak = claim.get("mainsnak", {}).get("datavalue", {})
+    kind, value = snak.get("type"), snak.get("value")
+    if kind == "wikibase-entityid":
+        return labels.get(value["id"], value["id"])
+    if kind == "time":
+        return (value.get("time") or "").lstrip("+").split("T")[0]
+    if kind == "quantity":
+        return value.get("amount", "").lstrip("+")
+    if kind == "string":
+        return value
+    return None
+
+
+async def wikidata(query: str, limit: int) -> list[dict]:
+    hits = (await http("https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json"
+                       f"&language=en&limit={limit}&search={quote(query)}")).json().get("search", [])
+    if not hits:
+        return []
+    ids = "|".join(h["id"] for h in hits)
+    entities = (await http(f"https://www.wikidata.org/w/api.php?action=wbgetentities&format=json"
+                           f"&ids={ids}&props=labels|descriptions|claims&languages=en")).json().get("entities", {})
+    ref_ids = {v["mainsnak"]["datavalue"]["value"]["id"]
+              for ent in entities.values() for pid in _WD_CLAIMS
+              for v in ent.get("claims", {}).get(pid, [])
+              if v.get("mainsnak", {}).get("datavalue", {}).get("type") == "wikibase-entityid"}
+    labels = {}
+    if ref_ids:
+        ref_entities = (await http("https://www.wikidata.org/w/api.php?action=wbgetentities&format=json"
+                                   f"&ids={'|'.join(ref_ids)}&props=labels&languages=en")).json().get("entities", {})
+        labels = {rid: (e.get("labels", {}).get("en", {}).get("value") or rid) for rid, e in ref_entities.items()}
+    out = []
+    for h in hits:
+        ent = entities.get(h["id"], {})
+        facts = []
+        for pid, label in _WD_CLAIMS.items():
+            for claim in ent.get("claims", {}).get(pid, [])[:1]:
+                v = _wd_value(claim, labels)
+                if v:
+                    facts.append(f"{label}: {v}")
+        out.append({"source": "wikidata", "title": h.get("label", h["id"]),
+                    "url": f"https://www.wikidata.org/wiki/{h['id']}",
+                    "snippet": h.get("description", ""), "date": "", "info": " · ".join(facts[:6])})
+    return out[:limit]
+
+
 SOURCES = {f.__name__: f for f in (wikipedia, hackernews, stackoverflow, github, openreview, huggingface_papers,
-                                   huggingface_models, lemmy, packages)}
+                                   huggingface_models, lemmy, packages, wikidata)}
 DEFAULT = ["wikipedia", "hackernews", "stackoverflow", "github", "openreview", "huggingface_papers"]
 
 
+async def _guarded(name: str, query: str, limit: int):
+    """Run one source, skipping it while health has it marked down and recording the outcome."""
+    wait = health.skipped(name)
+    if wait:
+        return "skipped", wait
+    try:
+        res = await SOURCES[name](query, limit)
+    except Exception as e:  # noqa: BLE001 - one bad source shouldn't cancel the others
+        health.record(name, False)
+        return "error", e
+    health.record(name, True)
+    return "ok", res
+
+
 async def search(query: str, names: list[str], limit: int) -> str:
-    runs = await asyncio.gather(*(SOURCES[n](query, limit) for n in names), return_exceptions=True)
+    runs = await asyncio.gather(*(_guarded(n, query, limit) for n in names))
     parts, notes = [], []
-    for name, res in zip(names, runs):
-        if isinstance(res, Exception):
-            notes.append(f"{name}: failed ({type(res).__name__}: {res})"[:160])
+    for name, (status, payload) in zip(names, runs):
+        if status == "skipped":
+            notes.append(f"{name}: skipped, retrying in {int(payload // 60) + 1} min")
             continue
-        notes.append(f"{name}: {len(res)}")
-        if res:
+        if status == "error":
+            notes.append(f"{name}: failed ({type(payload).__name__}: {payload})"[:160])
+            continue
+        notes.append(f"{name}: {len(payload)}")
+        if payload:
             parts.append(f"== {name} ==\n" + "\n".join(
                 f"{r['title']}\n  {r['url']}\n  " + " | ".join(x for x in (r["date"], r["info"]) if x)
-                + (f"\n  {r['snippet']}" if r["snippet"] else "") for r in res))
+                + (f"\n  {r['snippet']}" if r["snippet"] else "") for r in payload))
     return f"sources: {', '.join(notes)}\n\n" + "\n\n".join(parts)

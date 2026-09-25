@@ -33,11 +33,25 @@ async def stock(query: str) -> str:
             f"as of {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(meta.get('regularMarketTime', 0)))} (Yahoo Finance)")
 
 
+_currency_codes: set[str] | None = None
+
+
+async def _valid_currency_codes() -> set[str]:
+    """Frankfurter's currency list, fetched once and cached, so words like "how" aren't
+    mistaken for ISO codes."""
+    global _currency_codes
+    if _currency_codes is None:
+        data = (await http("https://api.frankfurter.dev/v1/currencies")).json()
+        _currency_codes = set(data.keys())
+    return _currency_codes
+
+
 async def currency(query: str) -> str:
     """"USD INR", "100 EUR to USD" or "USD" (against INR, EUR, GBP, JPY)."""
     amount = re.search(r"\d+(?:\.\d+)?", query)
-    codes = re.findall(r"\b[A-Za-z]{3}\b", query.replace(" to ", " "))
-    codes = [c.upper() for c in codes]
+    valid = await _valid_currency_codes()
+    codes = [c.upper() for c in re.findall(r"\b[A-Za-z]{3}\b", query.replace(" to ", " "))
+             if c.upper() in valid]
     if not codes:
         return "Give currency codes, e.g. \"USD INR\" or \"100 EUR to USD\"."
     base, targets = codes[0], ",".join(codes[1:]) or "INR,EUR,GBP,JPY,USD"
@@ -54,8 +68,10 @@ async def crypto(query: str) -> str:
     coin = coins[0]
     price = (await http(f"https://api.coingecko.com/api/v3/simple/price?ids={coin['id']}&vs_currencies=usd,inr"
                         "&include_24hr_change=true&include_market_cap=true")).json()[coin["id"]]
+    change = price.get("usd_24h_change")
+    change_str = f"{change:+.2f}% in 24h" if change is not None else "24h change unknown"
     return (f"{coin['name']} ({coin['symbol']}), market-cap rank {coin.get('market_cap_rank')}\n"
-            f"price: ${price['usd']:,} / ₹{price['inr']:,} ({price.get('usd_24h_change', 0):+.2f}% in 24h)\n"
+            f"price: ${price['usd']:,} / ₹{price['inr']:,} ({change_str})\n"
             f"market cap: ${price.get('usd_market_cap', 0):,.0f} (CoinGecko)")
 
 

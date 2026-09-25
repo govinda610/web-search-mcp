@@ -39,6 +39,9 @@ def _retry_after(r) -> float:
             return 60.0
 
 
+_RETRY_CAP = 30.0  # don't hold the lock across long sleeps; fail fast instead
+
+
 async def _reddit_get_locked(url: str, timeout: int) -> str:
     global _rss_last_hit
     now = time.time()
@@ -53,9 +56,14 @@ async def _reddit_get_locked(url: str, timeout: int) -> str:
             r = await c.get(url)
         _rss_last_hit = time.time()
         if r.status_code == 429:
+            retry_after = _retry_after(r)
+            sleep_for = retry_after * (1 + 0.5 * attempt) + random.uniform(0, 5)
+            if sleep_for > _RETRY_CAP:
+                raise ProviderError(
+                    f"Reddit rate-limited us; try again in {int(retry_after // 60) + 1} min")
             if attempt == 2:
                 raise ProviderError("reddit 429: rate limit persists after 3 attempts")
-            await asyncio.sleep(_retry_after(r) * (1 + 0.5 * attempt) + random.uniform(0, 5))
+            await asyncio.sleep(sleep_for)
             continue
         r.raise_for_status()
         _rss_cache[url] = (time.time(), r.text)
@@ -144,10 +152,25 @@ def _format_post_rss(text: str, target: str, limit: int = 10) -> str:
     return "\n".join(out) if out else f"No content for {target}"
 
 
+async def _resolve_share_link(url: str, timeout: int) -> str:
+    """New-style /r/<sub>/s/<id> share links redirect to the real /comments/ URL."""
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False,
+                                 headers={"User-Agent": _REDDIT_UA}) as c:
+        for method in (c.head, c.get):
+            r = await method(url)
+            location = r.headers.get("location")
+            if r.is_redirect and location:
+                return location.split("?")[0].split("#")[0]
+    return url  # not a redirect after all; fall through and let the caller handle it
+
+
 async def reddit_fetch(target: str, sort: str = "hot", limit: int = 15,
                        timeout: int = 15) -> str:
     """target: post/permalink URL (Arctic Shift archive -> throttled RSS) or subreddit."""
     if target.startswith(("http://", "https://")):
+        target = target.split("?")[0].split("#")[0]
+        if re.search(r"/r/[^/]+/s/[A-Za-z0-9]+/?$", target):
+            target = await _resolve_share_link(target, timeout)
         m = re.search(r"/comments/([a-z0-9]+)", target)
         if m:
             try:

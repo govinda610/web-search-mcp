@@ -68,9 +68,12 @@ def format_results(papers: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
+_OLD_ARXIV_ID = r"[a-z-]+(?:\.[A-Za-z]{2,})?/\d{7}(?:v\d+)?"  # pre-2007 style, e.g. hep-th/9901001
+
+
 def arxiv_id(ref: str) -> str | None:
     ref = ref.strip()
-    if re.fullmatch(r"\d{4}\.\d{4,5}(v\d+)?", ref):
+    if re.fullmatch(r"\d{4}\.\d{4,5}(v\d+)?", ref) or re.fullmatch(_OLD_ARXIV_ID, ref, re.I):
         return ref
     m = re.search(r"arxiv\.org/(?:abs|pdf)/([^?#\s]+?)(?:\.pdf)?/?$", ref, re.I) \
         or re.search(r"arxiv\.(\d{4}\.\d{4,5}(?:v\d+)?)", ref, re.I)  # 10.48550/arXiv.XXXX DOIs
