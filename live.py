@@ -1,5 +1,7 @@
 """Live numbers from keyless APIs: stock quotes (Yahoo Finance, NSE/BSE included), currency
-rates (Frankfurter, ECB data), crypto prices (CoinGecko) and weather (Open-Meteo)."""
+rates (Frankfurter, ECB data), crypto prices (CoinGecko), weather (Open-Meteo) and economic
+indicators (World Bank, FRED)."""
+import os
 import re
 import time
 from urllib.parse import quote
@@ -95,4 +97,64 @@ async def weather(query: str) -> str:
     return "\n".join(lines) + "\n(Open-Meteo)"
 
 
-KINDS = {"stock": stock, "currency": currency, "crypto": crypto, "weather": weather}
+# indicator word -> World Bank code; longest phrase checked first so "gdp growth" beats "gdp"
+WB_INDICATORS = {"gdp growth": "NY.GDP.MKTP.KD.ZG", "gdp": "NY.GDP.MKTP.CD", "inflation": "FP.CPI.TOTL.ZG",
+                 "cpi": "FP.CPI.TOTL.ZG", "unemployment": "SL.UEM.TOTL.ZS", "population": "SP.POP.TOTL",
+                 "debt": "GC.DOD.TOTL.GD.ZS"}
+WB_ALIASES = {"us": "united states", "usa": "united states", "america": "united states", "uk": "united kingdom"}
+
+_wb_countries: dict[str, str] | None = None
+
+
+async def _wb_country_codes() -> dict[str, str]:
+    """World Bank's own country/aggregate list, name -> id, fetched once and cached."""
+    global _wb_countries
+    if _wb_countries is None:
+        data = (await http("https://api.worldbank.org/v2/country?format=json&per_page=400")).json()
+        _wb_countries = {c["name"].lower(): c["id"] for c in data[1]}
+    return _wb_countries
+
+
+async def economy(query: str) -> str:
+    """"India GDP growth", "US CPI", "world population". Indicators: gdp, gdp growth,
+    inflation/cpi, unemployment, population, debt, via the World Bank. For other US series
+    (with FRED_API_KEY set), falls back to searching FRED by name."""
+    words = query.lower()
+    indicator = next((code for name, code in sorted(WB_INDICATORS.items(), key=lambda x: -len(x[0]))
+                      if re.search(rf"\b{re.escape(name)}\b", words)), None)
+    countries = await _wb_country_codes()
+    country = next((name for name in sorted(countries, key=len, reverse=True)
+                    if re.search(rf"\b{re.escape(name)}\b", words)), None)
+    if not country:
+        alias = next((a for a in WB_ALIASES if re.search(rf"\b{a}\b", words)), None)
+        country = WB_ALIASES.get(alias)
+    if indicator and country:
+        code_id = countries[country]
+        data = (await http(f"https://api.worldbank.org/v2/country/{code_id}/indicator/{indicator}"
+                           "?format=json&per_page=20")).json()
+        points = [p for p in data[1] if p.get("value") is not None][:8] if len(data) > 1 else []
+        if not points:
+            return f"No World Bank data for {country.title()} / {indicator}."
+        lines = [f"{points[0]['country']['value']}: {points[0]['indicator']['value']}"]
+        for p in reversed(points):
+            lines.append(f"{p['date']}: {p['value']:,.2f}")
+        return "\n".join(lines) + "\n(World Bank)"
+    key = os.environ.get("FRED_API_KEY")
+    if not key:
+        return ('No World Bank match. Ask e.g. "India GDP growth" or "US population" '
+                '(indicators: gdp, gdp growth, inflation/cpi, unemployment, population, debt), '
+                "or set FRED_API_KEY to search other US series by name.")
+    found = (await http(f"https://api.stlouisfed.org/fred/series/search?search_text={quote(query)}"
+                        f"&api_key={key}&file_type=json&limit=1")).json().get("seriess") or []
+    if not found:
+        return f"No FRED series found for {query!r}."
+    series = found[0]
+    obs = (await http(f"https://api.stlouisfed.org/fred/series/observations?series_id={series['id']}"
+                      f"&api_key={key}&file_type=json&sort_order=desc&limit=8")).json().get("observations", [])
+    lines = [f"{series['title']} ({series['id']}, {series.get('units', '')}, {series.get('frequency', '')})"]
+    for o in reversed(obs):
+        lines.append(f"{o['date']}: {o['value']}")
+    return "\n".join(lines) + "\n(FRED, Federal Reserve Bank of St. Louis)"
+
+
+KINDS = {"stock": stock, "currency": currency, "crypto": crypto, "weather": weather, "economy": economy}

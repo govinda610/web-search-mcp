@@ -18,3 +18,15 @@ engines:
   - name: mojeek
     disabled: false
     inactive: false
+  # Checked 2026-09: these answer without a key or captcha. qwant (captcha), 1337x (Cloudflare),
+  # startpage (proof-of-work captcha) and marginalia (needs a key) don't.
+  - name: yep
+    disabled: false
+  - name: mwmbl
+    disabled: false
+  - name: crossref
+    disabled: false
+  - name: openalex
+    disabled: false
+  - name: openlibrary
+    disabled: false

@@ -1,8 +1,13 @@
-"""Keyless datasets: GDELT news trends, SEC filings, OpenStreetMap places."""
+"""Keyless datasets: GDELT news trends, SEC filings, OpenStreetMap places, Google News."""
 import asyncio
+import html as htmllib
 import os
+import re
 import time
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
+
+from googlenewsdecoder import GoogleDecoderAsync
 
 from media import http
 from providers import ProviderError
@@ -43,6 +48,47 @@ async def news_trends(query: str, timespan: str = "1w", limit: int = 10) -> str:
         lines.append(f"- {a.get('title', '')} ({a.get('domain', '')}, {a.get('seendate', '')})\n  {a.get('url', '')}")
     return "\n".join(lines)
 
+
+def _rss_field(item: str, tag: str) -> str:
+    m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", item, re.DOTALL)
+    return htmllib.unescape(m.group(1).strip()) if m else ""
+
+
+async def google_news(query: str, recency: str, limit: int) -> list[dict]:
+    """Google News RSS. The link is Google's own redirect URL, not the article's; resolving it
+    needs a follow-up request per article (it's a JS redirect, not an HTTP one), so it's left as-is."""
+    op = {"day": "1d", "week": "7d", "month": "30d", "year": "1y"}.get(recency, "")
+    q = f"{query} when:{op}" if op else query
+    r = await http(f"https://news.google.com/rss/search?q={quote(q)}&hl=en-US&gl=US&ceid=US:en")
+    out = []
+    for item in r.text.split("<item>")[1:limit + 1]:
+        title, source = _rss_field(item, "title"), _rss_field(item, "source")
+        date = _rss_field(item, "pubDate")
+        try:
+            date = parsedate_to_datetime(date).strftime("%Y-%m-%d") if date else ""
+        except ValueError:
+            date = ""
+        out.append({"title": title.removesuffix(f" - {source}") if source else title,
+                    "url": _rss_field(item, "link"), "source": source, "date": date})
+    return out
+
+
+
+async def resolve_google_news(items: list[dict]) -> None:
+    """Swap Google News redirect links (300+ characters each) for the article URLs, in place.
+    Google hides the target behind a signed batchexecute call, so this takes one page fetch
+    per article plus one POST for all of them. A link that doesn't resolve stays as it was."""
+    wrapped = [r for r in items if "news.google.com/" in r["url"]]
+    if not wrapped:
+        return
+    try:
+        async with GoogleDecoderAsync(timeout=10) as decoder:
+            decoded = await decoder.decode_google_news_urls([r["url"] for r in wrapped])
+    except Exception:  # noqa: BLE001 - the long links still work
+        return
+    for r, d in zip(wrapped, decoded):
+        if d.get("success"):
+            r["url"] = d["decoded_url"]
 
 # ---------------------------------------------------------------- SEC EDGAR
 
@@ -164,7 +210,7 @@ async def places(query: str, near: str = "", limit: int = 10) -> str:
         try:  # Overpass answers 406 to some User-Agents (curl's among them), so send ours
             r = await http(endpoint, form={"data": ql}, timeout=25, headers={"User-Agent": _OSM_UA})
             break
-        except RuntimeError as e:
+        except Exception as e:  # noqa: BLE001 - HTTP errors and TLS failures alike: try the mirror
             error = e
     else:
         raise RuntimeError(f"OpenStreetMap search (Overpass) unavailable: {error}")
