@@ -11,6 +11,7 @@ and results are cached for an hour. Sites your ISP blocks are retried through To
 """
 import asyncio
 import base64
+import hashlib
 import html as htmllib
 import os
 import re
@@ -22,8 +23,11 @@ from urllib.parse import quote, urlparse
 from curl_cffi import AsyncSession
 
 import fetch
+import health
 import mirrors
+import movies
 import providers
+import quality
 from store import STATE, load_json, save_json
 
 TOR = os.environ.get("TOR_PROXY", "socks5h://127.0.0.1:9050")
@@ -86,15 +90,34 @@ def _size(n) -> str:
     return f"{n:.1f} PB"
 
 
+def _size_bytes(size: str) -> int | None:
+    """Inverse of _size(): recovers raw bytes from a result's formatted "4.3 GB" string, for
+    quality.classify's undersized-file check. None if the string doesn't parse."""
+    m = re.match(r"([\d.]+)\s*([KMGTP]?B)", size or "", re.IGNORECASE)
+    if not m:
+        return None
+    scale = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4, "PB": 1024**5}
+    return int(float(m.group(1)) * scale[m.group(2).upper()])
+
+
 def _hex_hash(infohash: str) -> str:
-    """Infohashes come as 40 hex chars or 32 base32 chars; use hex so duplicates match."""
+    """Infohashes come as 40 hex chars or 32 base32 chars; use hex so duplicates match.
+    Raises binascii.Error on a malformed hash; use _try_hex_hash to drop just that item."""
     if len(infohash) == 32:
         return base64.b32decode(infohash.upper()).hex()
     return infohash.lower()
 
 
-def _magnet(infohash: str, name: str) -> str:
-    return f"magnet:?xt=urn:btih:{_hex_hash(infohash)}&dn={quote(name)}"
+def _try_hex_hash(infohash: str) -> str | None:
+    """None on a malformed hash, so the caller drops that one item, not the source's whole list."""
+    try:
+        return _hex_hash(infohash)
+    except Exception:  # noqa: BLE001 - any decode failure means this one item is unusable
+        return None
+
+
+def _magnet(hexhash: str, name: str) -> str:
+    return f"magnet:?xt=urn:btih:{hexhash}&dn={quote(name)}"
 
 
 # ---------------------------------------------------------------- torrents
@@ -107,16 +130,48 @@ async def knaben(query: str, limit: int, category: str = "") -> list[dict]:
     hits = r.json()["hits"]
     prefix = {"movies": "Movies", "tv": "TV", "anime": "Anime", "games": "PC Games",
               "books": "Books", "comics": "Books", "manga": "Anime", "music": "Audio"}.get(category)
-    return [{"source": f"knaben/{h.get('cachedOrigin') or '?'}", "title": h["title"],
-             "size": _size(h.get("bytes")), "seeders": h.get("seeders") or 0,
-             "year": (h.get("date") or "")[:4], "info": h.get("category") or "",
-             "magnet": _magnet(h["hash"], h["title"]), "hash": h["hash"].lower(),
-             "url": h.get("details") or ""}
-            for h in hits if h.get("hash") and (not prefix or (h.get("category") or "").startswith(prefix))][:limit]
+    out = []
+    for h in hits:
+        if not h.get("hash") or (prefix and not (h.get("category") or "").startswith(prefix)):
+            continue
+        hexhash = _try_hex_hash(h["hash"])
+        if not hexhash:
+            continue
+        out.append({"source": f"knaben/{h.get('cachedOrigin') or '?'}", "title": h["title"],
+                    "size": _size(h.get("bytes")), "seeders": h.get("seeders") or 0,
+                    "year": (h.get("date") or "")[:4], "info": h.get("category") or "",
+                    "magnet": _magnet(hexhash, h["title"]), "hash": hexhash, "url": h.get("details") or ""})
+        if len(out) >= limit:
+            break
+    return out
 
 
 APIBAY_GROUPS = {"movies": {201, 202, 207, 209}, "tv": {205, 208}, "games": {400, 401, 404, 408},
                  "books": {601}, "comics": {602}, "anime": {201, 205, 207, 208}}
+
+
+PIRATEBAY_ENRICH = 5  # fetch uploader status + file list for at most this many, and only the top ones
+
+
+async def _piratebay_extra(tid: str) -> tuple[str, list[str]]:
+    """Uploader trust status and any executable/script bundled inside the torrent's own file
+    list — apibay exposes both for free, but only fetch it for a torrent we're about to show."""
+    status, warnings = "", []
+    try:
+        t = (await http(f"https://apibay.org/t.php?id={tid}")).json()
+        if t.get("status") in ("trusted", "vip"):
+            status = t["status"]
+    except Exception:  # noqa: BLE001, S110 - best-effort enrichment, never blocks the result
+        pass
+    try:
+        files = (await http(f"https://apibay.org/f.php?id={tid}")).json()
+        bad = [f["name"][0] for f in files if f.get("name")
+               and f["name"][0].lower().endswith((".exe", ".scr", ".bat", ".cmd", ".msi", ".lnk", ".vbs"))]
+        if bad:
+            warnings.append(f"contains {', '.join(bad[:3])}")
+    except Exception:  # noqa: BLE001, S110 - best-effort enrichment, never blocks the result
+        pass
+    return status, warnings
 
 
 async def piratebay(query: str, limit: int, category: str = "") -> list[dict]:
@@ -128,20 +183,45 @@ async def piratebay(query: str, limit: int, category: str = "") -> list[dict]:
             continue  # apibay's "no results" row
         if wanted and int(it.get("category", 0)) not in wanted:
             continue
+        hexhash = _try_hex_hash(it["info_hash"])
+        if not hexhash:
+            continue
         out.append({"source": "piratebay", "title": it["name"], "size": _size(it.get("size")),
                     "seeders": int(it.get("seeders", 0)), "year": time.strftime("%Y", time.gmtime(int(it.get("added", 0)))),
-                    "info": f"cat {it.get('category')}", "magnet": _magnet(it["info_hash"], it["name"]),
-                    "hash": it["info_hash"].lower(), "url": f"https://thepiratebay.org/description.php?id={it['id']}"})
-    return sorted(out, key=lambda x: -x["seeders"])[:limit]
+                    "info": f"cat {it.get('category')}", "magnet": _magnet(hexhash, it["name"]),
+                    "hash": hexhash, "url": f"https://thepiratebay.org/description.php?id={it['id']}",
+                    "_id": it["id"]})
+    out = sorted(out, key=lambda x: -x["seeders"])[:limit]
+    try:
+        extras = await asyncio.wait_for(asyncio.gather(
+            *(_piratebay_extra(r["_id"]) for r in out[:PIRATEBAY_ENRICH]), return_exceptions=True), 8)
+    except TimeoutError:
+        extras = []
+    for r, extra in zip(out, extras):
+        if isinstance(extra, Exception):
+            continue
+        status, warnings = extra
+        if status:
+            r["info"] = f"{r['info']} · {status} uploader" if r["info"] else f"{status} uploader"
+        if warnings:
+            r["warnings"] = warnings
+    for r in out:
+        r.pop("_id", None)
+    return out
 
 
 async def torrents_csv(query: str, limit: int, category: str = "") -> list[dict]:
     """Torrents-CSV: an open index built by crawling the DHT, so it has no domain to seize."""
     r = await http(f"https://torrents-csv.com/service/search?q={quote(query)}&size={limit}")
-    return [{"source": "torrents-csv", "title": t["name"], "size": _size(t.get("size_bytes")),
-             "seeders": t.get("seeders", 0), "year": time.strftime("%Y", time.gmtime(t.get("created_unix", 0))),
-             "magnet": _magnet(t["infohash"], t["name"]), "hash": t["infohash"].lower(), "url": ""}
-            for t in r.json().get("torrents", [])]
+    out = []
+    for t in r.json().get("torrents", []):
+        hexhash = _try_hex_hash(t["infohash"])
+        if not hexhash:
+            continue
+        out.append({"source": "torrents-csv", "title": t["name"], "size": _size(t.get("size_bytes")),
+                    "seeders": t.get("seeders", 0), "year": time.strftime("%Y", time.gmtime(t.get("created_unix", 0))),
+                    "magnet": _magnet(hexhash, t["name"]), "hash": hexhash, "url": ""})
+    return out
 
 
 async def yts(query: str, limit: int, category: str = "") -> list[dict]:
@@ -149,16 +229,19 @@ async def yts(query: str, limit: int, category: str = "") -> list[dict]:
     async def attempt(base):
         r = await http(f"{base}/api/v2/list_movies.json?query_term={quote(query)}&limit={limit}")
         return r.json()["data"].get("movies") or []
-    movies = await mirrors.call("yts", ["https://movies-api.accel.li", "https://yts.gg"],
-                                {"prowlarr": "yts"}, attempt)
+    listings = await mirrors.call("yts", ["https://movies-api.accel.li", "https://yts.gg"],
+                                  {"prowlarr": "yts"}, attempt)
     out = []
-    for m in movies:
+    for m in listings:
         for t in m.get("torrents", []):
+            hexhash = _try_hex_hash(t["hash"])
+            if not hexhash:
+                continue
             name = f"{m['title_long']} [{t['quality']} {t.get('type', '')}]".strip()
             out.append({"source": "yts", "title": name, "size": _size(t.get("size_bytes")),
                         "seeders": t.get("seeds", 0), "year": str(m.get("year", "")),
                         "info": f"IMDb {m.get('imdb_code', '')} rating {m.get('rating', '')}",
-                        "magnet": _magnet(t["hash"], name), "hash": t["hash"].lower(), "url": m.get("url", "")})
+                        "magnet": _magnet(hexhash, name), "hash": hexhash, "url": m.get("url", "")})
     return out
 
 
@@ -180,10 +263,13 @@ async def nyaa(query: str, limit: int, category: str = "") -> list[dict]:
     out = []
     for item in xml.split("<item>")[1:limit + 1]:
         infohash, title = _rss_tag(item, "nyaa:infoHash"), _rss_tag(item, "title")
+        hexhash = _try_hex_hash(infohash)
+        if not hexhash:
+            continue
         out.append({"source": "nyaa", "title": title, "size": _rss_tag(item, "nyaa:size"),
                     "seeders": int(_rss_tag(item, "nyaa:seeders") or 0),
                     "year": _rss_tag(item, "pubDate")[12:16], "info": _rss_tag(item, "nyaa:category"),
-                    "magnet": _magnet(infohash, title), "hash": infohash.lower(), "url": _rss_tag(item, "guid")})
+                    "magnet": _magnet(hexhash, title), "hash": hexhash, "url": _rss_tag(item, "guid")})
     return out
 
 
@@ -201,20 +287,29 @@ async def subsplease(query: str, limit: int, category: str = "") -> list[dict]:
             continue
         title = f"{entry.get('show')} - {entry.get('episode')} [{best['res']}p]"
         infohash = re.search(r"btih:(\w+)", best["magnet"]).group(1)
+        hexhash = _try_hex_hash(infohash)
+        if not hexhash:
+            continue
         out.append({"source": "subsplease", "title": title, "size": "", "seeders": 0,
-                    "year": (entry.get("release_date") or "")[-4:], "magnet": _magnet(infohash, title),
-                    "hash": _hex_hash(infohash), "url": f"https://subsplease.org/shows/{entry.get('page', '')}"})
+                    "year": (entry.get("release_date") or "")[-4:], "magnet": _magnet(hexhash, title),
+                    "hash": hexhash, "url": f"https://subsplease.org/shows/{entry.get('page', '')}"})
     return out[:limit]
 
 
 async def animetosho(query: str, limit: int, category: str = "") -> list[dict]:
     """AnimeTosho: mirrors Nyaa, AniDex and nekoBT, with direct-download links too."""
     r = await http(f"https://animetosho.org/feed/json?q={quote(query)}")
-    return [{"source": "animetosho", "title": t["title"], "size": _size(t.get("total_size")),
-             "seeders": t.get("seeders") or 0, "year": time.strftime("%Y", time.gmtime(t.get("timestamp", 0))),
-             "magnet": _magnet(t["info_hash"], t["title"]), "hash": _hex_hash(t["info_hash"]),
-             "url": t.get("link", "")}
-            for t in r.json()[:limit] if t.get("info_hash")]
+    out = []
+    for t in r.json()[:limit]:
+        if not t.get("info_hash"):
+            continue
+        hexhash = _try_hex_hash(t["info_hash"])
+        if not hexhash:
+            continue
+        out.append({"source": "animetosho", "title": t["title"], "size": _size(t.get("total_size")),
+                    "seeders": t.get("seeders") or 0, "year": time.strftime("%Y", time.gmtime(t.get("timestamp", 0))),
+                    "magnet": _magnet(hexhash, t["title"]), "hash": hexhash, "url": t.get("link", "")})
+    return out
 
 
 async def fitgirl(query: str, limit: int, category: str = "") -> list[dict]:
@@ -251,10 +346,13 @@ async def eztv(query: str, limit: int, category: str = "") -> list[dict]:
     for t in data.get("torrents") or []:
         if episode and episode.group(0).lower() not in t["filename"].lower():
             continue
+        hexhash = _try_hex_hash(t["hash"])
+        if not hexhash:
+            continue
         out.append({"source": "eztv", "title": t["filename"], "size": _size(t.get("size_bytes")),
                     "seeders": t.get("seeds", 0), "year": time.strftime("%Y", time.gmtime(t.get("date_released_unix", 0))),
                     "info": f"{show['name']} S{t.get('season')}E{t.get('episode')}",
-                    "magnet": _magnet(t["hash"], t["filename"]), "hash": t["hash"].lower(),
+                    "magnet": _magnet(hexhash, t["filename"]), "hash": hexhash,
                     "url": t.get("episode_url", "")})
     return sorted(out, key=lambda x: -x["seeders"])[:limit]
 
@@ -278,13 +376,88 @@ async def limetorrents(query: str, limit: int, category: str = "") -> list[dict]
         kind = _rss_tag(item, "category")
         if not infohash or (wanted and not kind.startswith(wanted)):
             continue
+        hexhash = _try_hex_hash(infohash.group(1))
+        if not hexhash:
+            continue
         title = _rss_tag(item, "title")
         seeds = re.search(r"Seeds: (\d+)", item)
         out.append({"source": "limetorrents", "title": title, "size": _size(_rss_tag(item, "size")),
                     "seeders": int(seeds.group(1)) if seeds else 0, "year": _rss_tag(item, "pubDate")[7:11],
-                    "info": kind, "magnet": _magnet(infohash.group(1), title), "hash": infohash.group(1).lower(),
+                    "info": kind, "magnet": _magnet(hexhash, title), "hash": hexhash,
                     "url": _rss_tag(item, "link")})
     return sorted(out, key=lambda x: -x["seeders"])[:limit]
+
+
+async def torrentio(query: str, limit: int, category: str = "") -> list[dict]:
+    """Torrentio: a keyless aggregator over public trackers, keyed by IMDb id (movies.imdb_id).
+    For TV it needs one specific episode, so it only runs when the query has "s01e02"."""
+    episode = re.search(r"\bs(\d{1,2})e(\d{1,3})\b", query, re.IGNORECASE)
+    if category == "tv" and not episode:
+        return []
+    words = re.sub(r"\bs\d{1,2}(e\d{1,3})?\b", "", query, flags=re.IGNORECASE).strip() if episode else query
+    tt = await movies.imdb_id(words, "tv" if episode else category)
+    if not tt:
+        return []
+    kind = f"series/{tt}:{int(episode.group(1))}:{int(episode.group(2))}" if episode else f"movie/{tt}"
+    r = await http(f"https://torrentio.strem.fun/stream/{kind}.json", timeout=20)
+    out = []
+    for s in (r.json().get("streams") or [])[:limit]:
+        if not s.get("infoHash"):
+            continue
+        hexhash = _try_hex_hash(s["infoHash"])
+        if not hexhash:
+            continue
+        name = (s.get("behaviorHints") or {}).get("filename") or s["title"].split("\n")[0]
+        seeders = re.search(r"👤 ?(\d+)", s["title"])
+        size = re.search(r"💾 ?([\d.]+ ?\w+)", s["title"])
+        tracker = re.search(r"⚙️ ?(\S+)", s["title"])
+        out.append({"source": "torrentio", "title": name, "size": size.group(1) if size else "",
+                    "seeders": int(seeders.group(1)) if seeders else 0, "year": "",
+                    "info": f"via {tracker.group(1)}" if tracker else "",
+                    "magnet": _magnet(hexhash, name), "hash": hexhash, "url": ""})
+    return out
+
+
+async def prowlarr(query: str, limit: int, category: str = "") -> list[dict]:
+    """Your own Prowlarr instance, if configured (PROWLARR_URL + PROWLARR_API_KEY): every
+    indexer you've added there, searched at once. A no-op (empty list) when not configured."""
+    base, key = os.environ.get("PROWLARR_URL"), os.environ.get("PROWLARR_API_KEY")
+    if not base or not key:
+        return []
+    r = await http(f"{base.rstrip('/')}/api/v1/search?query={quote(query)}&type=search&apikey={key}")
+    out = []
+    for it in r.json()[:limit]:
+        link = it.get("magnetUrl") or it.get("downloadUrl") or ""
+        entry = {"source": f"prowlarr/{it.get('indexer', '?')}", "title": it.get("title", ""),
+                "size": _size(it.get("size")), "seeders": it.get("seeders") or 0,
+                "year": str(it.get("publishDate") or "")[:4],
+                "magnet": link if link.startswith("magnet:") else "",
+                "url": it.get("infoUrl") or (link if not link.startswith("magnet:") else "")}
+        if it.get("infoHash") and (hexhash := _try_hex_hash(it["infoHash"])):
+            entry["hash"] = hexhash
+        out.append(entry)
+    return out
+
+
+async def jackett(query: str, limit: int, category: str = "") -> list[dict]:
+    """Your own Jackett instance, if configured (JACKETT_URL + JACKETT_API_KEY): every indexer
+    you've added there, searched at once. A no-op (empty list) when not configured."""
+    base, key = os.environ.get("JACKETT_URL"), os.environ.get("JACKETT_API_KEY")
+    if not base or not key:
+        return []
+    r = await http(f"{base.rstrip('/')}/api/v2.0/indexers/all/results?apikey={key}&Query={quote(query)}")
+    out = []
+    for it in r.json().get("Results", [])[:limit]:
+        link = it.get("MagnetUri") or it.get("Link") or ""
+        entry = {"source": f"jackett/{it.get('Tracker', '?')}", "title": it.get("Title", ""),
+                "size": _size(it.get("Size")), "seeders": it.get("Seeders") or 0,
+                "year": str(it.get("PublishDate") or "")[:4],
+                "magnet": link if link.startswith("magnet:") else "",
+                "url": it.get("Details") or (link if not link.startswith("magnet:") else "")}
+        if it.get("InfoHash") and (hexhash := _try_hex_hash(it["InfoHash"])):
+            entry["hash"] = hexhash
+        out.append(entry)
+    return out
 
 
 # ---------------------------------------------------------------- books, comics
@@ -330,14 +503,15 @@ async def libgen(query: str, limit: int, category: str = "") -> list[dict]:
 
 async def annas_archive(query: str, limit: int, category: str = "") -> list[dict]:
     """Anna's Archive: the largest shadow-library index (LibGen, Z-Library, Sci-Hub, IA).
-    It sits behind DDoS-Guard, so this goes through the browser stage; the first time, a
-    window opens for you to tick the check, and the saved cookies cover later searches."""
+    It sits behind DDoS-Guard, so this goes through the browser stage; interactive=False so a
+    search never blocks on a visible window. Run fetch_page on an annas-archive URL once to
+    solve the check yourself and save the cookies this then reuses."""
     content = {"books": "&content=book_nonfiction&content=book_fiction&content=book_unknown",
                "comics": "&content=book_comic", "papers": "&content=journal_article",
                "magazines": "&content=magazine"}.get(category, "")
 
     async def attempt(base):
-        page = await fetch.fetch(f"{base}/search?q={quote(query)}{content}", 20)
+        page = await fetch.fetch(f"{base}/search?q={quote(query)}{content}", 20, interactive=False)
         text = page.body.decode("utf-8", "replace")
         if "js-vim-focus" not in text:
             raise RuntimeError("not an Anna's Archive results page")
@@ -607,31 +781,47 @@ async def tvmaze(query: str, limit: int, category: str = "") -> list[dict]:
 # ---------------------------------------------------------------- routing
 
 # What a title is; everything else is where to get it.
-CATALOGS = {"anilist", "mangadex", "mangaupdates", "tvmaze", "kuryana", "itunes"}
+async def imdb(query: str, limit: int, category: str = "") -> list[dict]:
+    """movies.imdb, referenced at call time: movies imports media, so either can be imported first."""
+    return await movies.imdb(query, limit, category)
+
+
+CATALOGS = {"anilist", "mangadex", "mangaupdates", "tvmaze", "kuryana", "itunes", "imdb"}
 SOURCES = {
     "books": [libgen, annas_archive, zlibrary, openlibrary, gutenberg, knaben],
     "comics": [libgen, getcomics, annas_archive, zlibrary],
     "manga": [anilist, mangaupdates, mangadex, weebcentral, nyaa, libgen],
     "anime": [anilist, subsplease, animetosho, nyaa, knaben],
-    "movies": [yts, knaben, piratebay, torrents_csv, limetorrents],
-    "tv": [tvmaze, kuryana, eztv, kisskh, knaben, piratebay, torrents_csv, limetorrents],
+    "movies": [imdb, yts, knaben, piratebay, torrents_csv, limetorrents, torrentio, prowlarr, jackett],
+    "tv": [imdb, tvmaze, kuryana, eztv, kisskh, knaben, piratebay, torrents_csv, limetorrents, torrentio,
+          prowlarr, jackett],
     "subtitles": [opensubtitles],
     "audiobooks": [itunes, archive_org, audiobookbay],
     "music": [itunes, archive_org, knaben, limetorrents],
     "podcasts": [itunes],
     "games": [fitgirl, archive_org],
     "software": [archive_org],
-    "torrents": [knaben, piratebay, torrents_csv, nyaa, limetorrents],
+    "torrents": [knaben, piratebay, torrents_csv, nyaa, limetorrents, prowlarr, jackett],
 }
 SOURCES["all"] = list(dict.fromkeys(f for fns in SOURCES.values() for f in fns))
+
+
+SEARCH_DEADLINE = 30  # seconds; a still-running source is left running for the cache, not cancelled
+_pending: set[asyncio.Task] = set()  # keeps background tasks alive past search()'s return
 
 
 async def _cached(fn, query: str, limit: int, category: str):
     key = (fn.__name__, query.lower(), limit, category)
     hit = _cache.get(key)
     if hit and time.time() - hit[0] < CACHE_TTL:
+        health.record(fn.__name__, True)
         return hit[1]
-    results = await asyncio.wait_for(fn(query, limit, category), timeout=150)
+    try:
+        results = await asyncio.wait_for(fn(query, limit, category), timeout=150)
+    except Exception:
+        health.record(fn.__name__, False)
+        raise
+    health.record(fn.__name__, True)
     for old in [k for k, (at, _) in _cache.items() if time.time() - at > CACHE_TTL]:
         del _cache[old]
     _cache[key] = (time.time(), results)
@@ -640,17 +830,39 @@ async def _cached(fn, query: str, limit: int, category: str):
 
 async def search(query: str, category: str = "all", limit: int = 10,
                  only: list[str] | None = None) -> tuple[list[dict], list[dict], list[str]]:
-    """Fan out to every source for the category in parallel.
+    """Fan out to every source for the category in parallel, for at most SEARCH_DEADLINE seconds.
+    A source still running after that keeps running in the background (its result lands in the
+    cache for the next call) rather than being cancelled. A source failing twice in a row is
+    skipped for a while (health.py) instead of being retried every call.
     Returns (catalog entries, downloadable results deduped by infohash/md5, per-source notes)."""
     fns = [f for f in SOURCES.get(category, SOURCES["all"]) if not only or f.__name__ in only]
-    runs = await asyncio.gather(*(_cached(f, query, limit, category) for f in fns), return_exceptions=True)
-    lists, notes = [], []
-    for fn, res in zip(fns, runs):
-        if isinstance(res, Exception):
-            notes.append(f"{fn.__name__}: failed ({type(res).__name__}: {res})"[:200])
+    notes, tasks = [], {}
+    for f in fns:
+        wait = health.skipped(f.__name__)
+        if wait:
+            notes.append(f"{f.__name__}: skipped, failing (retry in {int(wait // 60) + 1} min)")
+            continue
+        task = asyncio.ensure_future(_cached(f, query, limit, category))
+        _pending.add(task)
+        task.add_done_callback(_pending.discard)
+        tasks[task] = f
+    if tasks:
+        _, still_running = await asyncio.wait(tasks, timeout=SEARCH_DEADLINE)
+    else:
+        still_running = set()
+    lists = []
+    for task, fn in tasks.items():
+        if task in still_running:
+            notes.append(f"{fn.__name__}: still loading, try again shortly")
+            continue
+        try:
+            res = task.result()
+        except Exception as e:  # noqa: BLE001 - one source's failure doesn't stop the others
+            notes.append(f"{fn.__name__}: failed ({type(e).__name__}: {e})"[:200])
             continue
         notes.append(f"{fn.__name__}: {len(res)}")
         lists.append((fn.__name__ in CATALOGS, res))
+    runtime = await movies.runtime_min(query, category) if category in ("movies", "tv") else None
     # Take each source's best, then each one's second best, ... so every source is represented.
     catalog, found, seen = [], [], set()
     for rank in range(max((len(res) for _, res in lists), default=0)):
@@ -661,6 +873,11 @@ async def search(query: str, category: str = "all", limit: int = 10,
             key = r.get("hash") or r.get("md5") or r["url"] or r["title"]
             if key not in seen:
                 seen.add(key)
+                if not is_catalog and r.get("magnet"):
+                    q = quality.classify(r.get("title", ""), _size_bytes(r.get("size", "")), runtime)
+                    r["tier"], r["resolution"], r["is_cam"] = q["tier"], q["resolution"], q["is_cam"]
+                    r["quality_label"] = q["label"]
+                    r["warnings"] = r.get("warnings", []) + q["warnings"]
                 (catalog if is_catalog else found).append(r)
     return catalog, found, notes
 
@@ -668,7 +885,7 @@ async def search(query: str, category: str = "all", limit: int = 10,
 def format_results(catalog: list[dict], found: list[dict], notes: list[str], limit: int) -> str:
     def line(r):
         head = f"[{r['source']}] {r['title']}"
-        meta = " | ".join(x for x in (r.get("year"), r.get("size"),
+        meta = " | ".join(x for x in (r.get("year"), r.get("size"), r.get("quality_label"),
                                       f"{r['seeders']} seeders" if r.get("seeders") else "", r.get("info")) if x)
         out = f"{head}\n  {meta}" if meta else head
         for k in ("url", "magnet"):
@@ -678,12 +895,29 @@ def format_results(catalog: list[dict], found: list[dict], notes: list[str], lim
             out += f"\n  download: {r['download']}"
         if r.get("md5"):
             out += f"\n  md5: {r['md5']} (book_download)"
+        for w in r.get("warnings") or []:
+            out += f"\n  ⚠ {w}"
         return out
+
+    def quality_sort(r):
+        # Flagged (fake/suspicious) results sink to the bottom regardless of quality; among the
+        # rest, best tier/resolution/seeders first.
+        res = (r.get("resolution") or "").rstrip("p")
+        return (bool(r.get("warnings")), -r.get("tier", 3), -int(res) if res.isdigit() else 0, -r.get("seeders", 0))
+
+    torrents = [r for r in found if "tier" in r]
+    other = [r for r in found if "tier" not in r]
+    where = sorted((r for r in torrents if not r["is_cam"]), key=quality_sort) + other
+    cinema = sorted((r for r in torrents if r["is_cam"]), key=quality_sort)
+
     parts = [f"sources: {', '.join(notes)}"]
     if catalog:
         parts.append("WHAT IT IS:\n" + "\n".join(line(r) for r in catalog[:limit]))
-    if found:
-        parts.append("WHERE TO GET IT:\n" + "\n".join(line(r) for r in found[:limit * 3]))
+    if where:
+        parts.append("WHERE TO GET IT:\n" + "\n".join(line(r) for r in where[:limit * 3]))
+    if cinema:
+        parts.append("Cinema recordings (low quality, filmed in a theatre):\n"
+                      + "\n".join(line(r) for r in cinema[:limit]))
     return "\n\n".join(parts)
 
 
@@ -743,9 +977,20 @@ async def _libgen_file(md5: str):
                               {"slum": "libgen"}, attempt)
 
 
+MAX_DOWNLOAD_BYTES = 1024**3  # 1 GB; book/comic/paper files are never legitimately larger
+
+
 def save_download(r, md5: str, save_dir: str) -> str:
     """Save a download under its Content-Disposition name, never outside save_dir and never
-    over an existing file."""
+    over an existing file. Rejects an HTML response (a login/error page, not the file), a size
+    over MAX_DOWNLOAD_BYTES, and content whose md5 doesn't match the one that was requested."""
+    if "text/html" in r.headers.get("content-type", "").lower():
+        raise RuntimeError("got an HTML page instead of the file (login wall or dead link)")
+    if len(r.content) > MAX_DOWNLOAD_BYTES:
+        raise RuntimeError(f"{len(r.content):,} bytes exceeds the {MAX_DOWNLOAD_BYTES:,} byte cap")
+    digest = hashlib.md5(r.content).hexdigest()
+    if digest != md5:
+        raise RuntimeError(f"md5 mismatch: expected {md5}, got {digest}")
     header = Message()
     header["content-disposition"] = r.headers.get("content-disposition", "")
     name = Path(header.get_filename() or "").name  # get_filename decodes filename*=UTF-8''...

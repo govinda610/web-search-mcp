@@ -90,7 +90,10 @@ async def call(site: str, seeds: list[str], updates: dict, attempt):
             except Exception as e:  # noqa: BLE001 - any failure moves on to the next mirror
                 errors.append(f"{base}: {type(e).__name__}: {e}"[:160])
                 continue
-            entry["domains"] = [base] + [d for d in domains if d != base]
+            # Re-read entry["domains"] instead of closing over the pre-await `domains` snapshot:
+            # another concurrent call() for this site may have added domains while we were awaiting.
+            current = entry["domains"]
+            entry["domains"] = list(dict.fromkeys([base] + current + list(candidates)))
             _save(state)
             return True, result
         return False, None
