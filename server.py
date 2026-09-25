@@ -1,19 +1,21 @@
 """web-search MCP server — self-owned search/fetch stack (MCP SDK v2).
 
-Tools: web_search, news_search, suggest, image_search, knowledge_search, paper_search,
-paper_fetch, fetch_page, fetch_pages, site_map, reddit_fetch, youtube_transcript,
-social_fetch, live_data, media_search, book_download, discover_sources, usage_status.
+Tools: web_search, news_search, image_search, knowledge_search, paper_search, paper_fetch,
+fetch_page, fetch_pages, site_map, crawl_site, page_history, page_watch, youtube_transcript,
+social_fetch, live_data, deep_research, media_search, book_download, media_download,
+release_watch, server_status.
 Run: uv run server.py (stdio) | MCP_TRANSPORT=http uv run server.py (shared HTTP instance)
 """
 import asyncio
+import contextlib
 import json
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse
 
-import httpx
 from dotenv import load_dotenv
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -21,38 +23,64 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 import crawl
+import datasets
 import discover
+import download
 import fetch
+import health
 import knowledge
 import live
 import llm
 import media
 import mirrors
+import monitor
 import papers
 import providers
+import quality
 import quota
+import rerank
+import research
 import social
 import sources
+import watch
+import wayback
 
 ROOT = Path(__file__).parent
 load_dotenv(ROOT / ".env")
+for noisy in ("httpx", "httpcore"):  # one INFO line per request drowns the server log
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 CONFIG = json.loads((ROOT / "config.json").read_text())
 ENV = {k: os.environ.get(k, "") for k in [
     "SEARXNG_URL", "TAVILY_API_KEY", "EXA_API_KEY", "FIRECRAWL_API_KEY", "JINA_API_KEY"]}
 
 INSTRUCTIONS = """Local, keyless web research tools. Which to use:
 - a question or topic -> web_search (more_queries for several angles, depth="advanced" to read the top pages)
-- something that happened recently -> news_search
+- something that happened recently -> news_search (trends=True for coverage volume over time)
+- a broad question needing many sources and a cited report -> deep_research
 - facts, code, dev Q&A, ML models/papers, packages -> knowledge_search (Wikipedia, HN, Stack Overflow, GitHub...)
-- a stock price, exchange rate, crypto price or weather -> live_data
-- a specific URL -> fetch_page (several: fetch_pages; all pages of a site: site_map first)
-- Reddit -> reddit_fetch; YouTube -> youtube_transcript; X/Twitter, Bluesky, Telegram, Instagram -> social_fetch
+- a stock price, exchange rate, crypto price, weather, places near somewhere or SEC filings -> live_data
+- a specific URL -> fetch_page (several: fetch_pages; list a site's pages: site_map; read many: crawl_site)
+- an old version of a page -> fetch_page with as_of, or page_history to list snapshots
+- tell me when a page changes -> page_watch
+- YouTube text -> youtube_transcript; Reddit, X/Twitter, Bluesky, Telegram, Instagram -> social_fetch
 - research papers -> paper_search, then paper_fetch to read one
 - a book, comic, manga, anime, film, show, game, audiobook, music, podcast or subtitles -> media_search;
-  book_download saves a book by md5
+  book_download saves a book by md5; release_watch notifies when a good-quality release appears
+- save a video or audio (YouTube and ~1800 sites) as mp4/mp3/... -> media_download
 Long outputs are paged: pass start= as the output says. Failed calls return an error saying why."""
 
-mcp = MCPServer("web-search", title="Web search & research", instructions=INSTRUCTIONS)
+@contextlib.asynccontextmanager
+async def _watch_loop(_server):
+    """HTTP mode only (one long-lived process): re-check the watch list every WATCH_INTERVAL_HOURS."""
+    task = asyncio.create_task(watch.run_forever(float(os.environ.get("WATCH_INTERVAL_HOURS", "6"))))
+    try:
+        yield {}
+    finally:
+        task.cancel()
+
+
+mcp = MCPServer("web-search", title="Web search & research", instructions=INSTRUCTIONS,
+                lifespan=_watch_loop if os.environ.get("MCP_TRANSPORT") == "http" else None)
 READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=True)
 WRITES_FILES = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True)
 MediaSite = Literal[tuple(f.__name__ for f in media.SOURCES["all"])]
@@ -65,6 +93,21 @@ TRACKING_PARAMS = re.compile(r"^(utm_\w+|fbclid|gclid|dclid|msclkid|mc_[ce]id|re
 async def _progress(ctx: Context | None, done: float, total: float | None, message: str) -> None:
     if ctx is not None:
         await ctx.report_progress(done, total, message)
+
+
+def _download_dir(save_dir: str) -> Path:
+    """Where a download may go: inside your home folder, not a hidden folder or ~/Library, so a
+    prompt-injected page can't steer a file into ~/.ssh or LaunchAgents. DOWNLOAD_ALLOW_ANY_DIR=1 lifts it."""
+    folder = Path(save_dir).expanduser().resolve()
+    if os.environ.get("DOWNLOAD_ALLOW_ANY_DIR") == "1":
+        return folder
+    home = Path.home().resolve()
+    if not folder.is_relative_to(home):
+        raise ToolError(f"Not saving to {folder}: downloads go inside {home} (set DOWNLOAD_ALLOW_ANY_DIR=1 to allow).")
+    parts = folder.relative_to(home).parts
+    if parts and (parts[0] == "Library" or any(p.startswith(".") for p in parts)):
+        raise ToolError(f"Not saving to {folder}: hidden folders and ~/Library are off limits for downloads.")
+    return folder
 
 
 def _available_search_providers() -> list[dict]:
@@ -155,18 +198,18 @@ async def _auto_classify(query: str) -> dict:
     }
 
 
-async def _enrich(query, items, want_answer, want_highlights) -> str:
+async def _enrich(query, items, want_answer, want_highlights, ctx: Context | None = None) -> str:
     """LLM answer + highlights; silently skipped if coding-plan models are down/exhausted.
     Token budgets are generous because these are reasoning models: thinking eats the budget first."""
-    if not ((want_answer or want_highlights) and items and llm.llm_available()):
+    if not ((want_answer or want_highlights) and items and (llm.llm_available() or llm.can_sample(ctx))):
         return ""
-    ctx = "\n".join(f"[{i + 1}] {r['title']} | {r['url']} | {r.get('content') or r.get('snippet', '')[:220]}"
+    numbered = "\n".join(f"[{i + 1}] {r['title']} | {r['url']} | {r.get('content') or r.get('snippet', '')[:220]}"
                     for i, r in enumerate(items[:12]))
-    answer_prompt = f"Answer using ONLY the numbered results; cite as [n]. Query: {query}\n\n{ctx}"
-    highlights_prompt = f"5 key facts with [n] citations. Query: {query}\n\n{ctx}"
+    answer_prompt = f"Answer using ONLY the numbered results; cite as [n]. Query: {query}\n\n{numbered}"
+    highlights_prompt = f"5 key facts with [n] citations. Query: {query}\n\n{numbered}"
     answer, highlights = await asyncio.gather(  # llm.ask("") returns None without a call
-        llm.ask(answer_prompt if want_answer else "", max_tokens=2000),
-        llm.ask(highlights_prompt if want_highlights else "", max_tokens=1500))
+        llm.ask(answer_prompt if want_answer else "", max_tokens=2000, ctx=ctx),
+        llm.ask(highlights_prompt if want_highlights else "", max_tokens=1500, ctx=ctx))
     out = ""
     if answer:
         out += f"ANSWER (LLM-synthesized, [n] = source):\n{answer}\n\n"
@@ -244,22 +287,6 @@ async def _search(query: str, num_results: int, strategy: str, include: list[str
     return [], errors
 
 
-def _best_passages(text: str, query: str, limit: int = 1500) -> str:
-    """The paragraphs sharing the most words with the query, kept in document order."""
-    text = re.sub(r"(?s)\A---\n.*?\n---\n", "", text)  # trafilatura's metadata header
-    words = {w for w in re.findall(r"\w+", query.lower()) if len(w) > 2}
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if len(p.strip()) > 40]
-    scored = sorted(range(len(paragraphs)), reverse=True,
-                    key=lambda i: len(words & set(re.findall(r"\w+", paragraphs[i].lower()))))
-    picked, total = [], 0
-    for i in scored:
-        if total + len(paragraphs[i]) > limit and picked:
-            break
-        picked.append(i)
-        total += len(paragraphs[i])
-    return "\n\n".join(paragraphs[i] for i in sorted(picked))[:limit]
-
-
 async def _read_url(url: str, interactive: bool = True, fresh: bool = False, on_stage=None) -> tuple[str, str]:
     """(via, text) for any URL, routed to the right reader. Reddit is never scraped directly
     (it bans the IP); social posts use their public APIs, falling back to the page fetcher."""
@@ -286,7 +313,7 @@ async def _add_page_content(query: str, items: list[dict], top: int = 5) -> None
     async def one(r):
         try:
             _, text = await asyncio.wait_for(_read_url(r["url"], interactive=False), fetch.FETCH_DEADLINE)
-            r["content"] = _best_passages(text, query)
+            r["content"] = await asyncio.to_thread(rerank.best_passages, text, query)
         except Exception as e:  # noqa: BLE001 - a failed page keeps its search snippet
             r["content"] = ""
             r["fetch_error"] = (str(e) or type(e).__name__)[:120]
@@ -350,7 +377,7 @@ async def web_search(
     if depth == "advanced":
         await _progress(ctx, 1, None, f"reading the top {min(5, len(items))} pages")
         await _add_page_content(query, items)
-    out = await _enrich(query, items, answer, highlights)
+    out = await _enrich(query, items, answer, highlights, ctx)
     for r in items:
         tag = f"[{r['via']}]" + (f" (q: {r['query']})" if len(queries) > 1 else "")
         date = f"{r['published']} | " if r.get("published") else ""
@@ -359,6 +386,8 @@ async def web_search(
             out += "  --- page passages ---\n  " + r["content"].replace("\n", "\n  ") + "\n"
         elif r.get("fetch_error"):
             out += f"  (page not read: {r['fetch_error']})\n"
+    if errors:
+        out += f"\n(note: {len(errors)} provider call(s) failed or found nothing: " + "; ".join(errors)[:400] + ")"
     return out
 
 
@@ -367,8 +396,17 @@ async def news_search(
     query: Annotated[str, Field(description="Topic or event to find news about.")],
     num_results: Annotated[int, Field(description="Number of articles (1-20).", ge=1, le=20)] = 5,
     recency: Annotated[Literal["day", "week", "month", "year"], Field(description="How far back to look.")] = "day",
+    trends: Annotated[bool, Field(description=(
+        "Instead: GDELT's worldwide news index, with articles in many languages and daily coverage "
+        "volume, to see how much a topic is in the news and when it peaked (up to 3 months back)."))] = False,
 ) -> str:
-    """Recent news articles with source and date (SearXNG news, then Tavily)."""
+    """Recent news articles with source and date (SearXNG news, then Tavily), or GDELT coverage trends."""
+    if trends:
+        try:
+            timespan = {"day": "1d", "week": "1w", "month": "1m", "year": "3m"}[recency]
+            return "(via GDELT)\n" + await datasets.news_trends(query, timespan, num_results)
+        except Exception as e:  # noqa: BLE001
+            raise ToolError(f"GDELT news trends failed for {query!r}: {e}") from e
     available = {p["name"] for p in _available_search_providers()}
     errors = []
     for name in ("searxng", "tavily"):
@@ -387,22 +425,6 @@ async def news_search(
             return f"(via {name} news)\n" + "\n\n".join(out)
         errors.append(f"{name}: 0 results")
     raise ToolError(f"No news found for {query!r} in the last {recency}.\n" + "\n".join(errors))
-
-
-@mcp.tool(title="Search suggestions", annotations=READ_ONLY, structured_output=False)
-async def suggest(query: Annotated[str, Field(description="A partial query, e.g. \"how to learn rus\".")]) -> str:
-    """Autocomplete suggestions for a partial query: what people commonly search for. Use it to
-    discover better phrasings before searching."""
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get("https://duckduckgo.com/ac/", params={"q": query, "type": "list"},
-                            headers={"User-Agent": providers.UA})
-            r.raise_for_status()
-            data = r.json()
-    except Exception as e:  # noqa: BLE001
-        raise ToolError(f"Suggestions unavailable: {e}") from e
-    items = data[1] if len(data) > 1 and isinstance(data[1], list) else data
-    return "\n".join(str(s) for s in items[:10]) or "No suggestions."
 
 
 @mcp.tool(title="Image search", annotations=READ_ONLY, structured_output=False)
@@ -437,17 +459,29 @@ async def knowledge_search(
     return await knowledge.search(query, sites or knowledge.DEFAULT, num_results)
 
 
-@mcp.tool(title="Live data: stocks, currency, crypto, weather", annotations=READ_ONLY, structured_output=False)
+@mcp.tool(title="Live data: stocks, currency, crypto, weather, places, SEC filings", annotations=READ_ONLY,
+          structured_output=False)
 async def live_data(
-    kind: Annotated[Literal["stock", "currency", "crypto", "weather"], Field(description="What to look up.")],
+    kind: Annotated[Literal["stock", "currency", "crypto", "weather", "places", "sec_filings"],
+                    Field(description="What to look up.")],
     query: Annotated[str, Field(description=(
         'stock: ticker or company ("RELIANCE.NS", "AAPL", "nvidia"; .NS = NSE, .BO = BSE). '
-        'currency: "USD INR" or "100 EUR to USD". crypto: coin name or symbol. weather: a place name.'))],
+        'currency: "USD INR" or "100 EUR to USD". crypto: coin name or symbol. weather: a place name. '
+        'places: a place ("Kreuzberg, Berlin") or "<what> near <place>" ("cafe near Koramangala, Bangalore"). '
+        'sec_filings: US ticker or company, optionally with a form: "AAPL 10-K", "tesla 8-K".'))],
 ) -> str:
     """Current numbers from keyless public APIs: stock quote with day and 52-week range (Yahoo
     Finance), exchange rates (ECB via Frankfurter), crypto price (CoinGecko), weather now and
-    a 4-day forecast (Open-Meteo)."""
+    a 4-day forecast (Open-Meteo), places and what's around them (OpenStreetMap), and a US
+    company's recent SEC EDGAR filings with headline financials (needs SEC_USER_AGENT in .env)."""
     try:
+        if kind == "places":
+            what, _, near = query.partition(" near ")
+            return await datasets.places(what.strip(), near.strip())
+        if kind == "sec_filings":
+            m = re.match(r"^(.*?)\s+(10-K|10-Q|8-K|S-1|20-F|6-K|DEF 14A|13F-HR|4)$", query.strip(), re.IGNORECASE)
+            company, form = (m.group(1), m.group(2).upper()) if m else (query.strip(), "")
+            return await datasets.sec_filings(company, form)
         return await live.KINDS[kind](query)
     except Exception as e:  # noqa: BLE001
         raise ToolError(f"{kind} lookup failed for {query!r}: {e}") from e
@@ -463,7 +497,7 @@ async def paper_search(
     """Search research papers across arXiv, Semantic Scholar, Google Scholar, PubMed,
     EuropePMC and OpenAIRE. Returns title, year, authors, venue, citations, DOI and PDF link.
     Read one with paper_fetch. For ML conference papers with reviews, also try knowledge_search
-    with sources=["openreview"]."""
+    with sites=["openreview"]."""
     try:
         results = await papers.search(query, num_results, ENV["SEARXNG_URL"], TIMEOUT, year_from, year_to)
     except Exception as e:  # noqa: BLE001
@@ -489,7 +523,7 @@ async def paper_fetch(
             fetch.cache_put(url, page.text)
             via, text = page.via, page.text
             if fetch.is_pdf(page.content_type, page.body):
-                path = Path(save_dir).expanduser() / (re.sub(r"[^\w.-]+", "_", ref.split("://")[-1])[:120] + ".pdf")
+                path = _download_dir(save_dir) / (re.sub(r"[^\w.-]+", "_", ref.split("://")[-1])[:120] + ".pdf")
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(page.body)
                 note += f"; saved to {path}"
@@ -514,6 +548,9 @@ async def fetch_page(
         'Have an LLM pull structured data out of the page as JSON, described in words, e.g. '
         '"product name, price, rating" or "every event: date, title, venue".'))] = "",
     fresh: Annotated[bool, Field(description="Ignore the 1-hour cache and fetch again.")] = False,
+    as_of: Annotated[str, Field(description=(
+        'Read the Wayback Machine copy closest to this date instead of the live page, e.g. "2019-06-01" '
+        'or "2019". Empty = live page.'), pattern=r"^(\d{4}(-\d{2}(-\d{2})?)?)?$")] = "",
     ctx: Context | None = None,
 ) -> str:
     """Read a web page or PDF as clean markdown, with title/author/date when known.
@@ -524,6 +561,12 @@ async def fetch_page(
     through Tor. Long pages are paged: the output tells you the start= for the next part."""
     async def on_stage(stage: str):
         await _progress(ctx, 0, None, f"trying {stage}")
+    if as_of:
+        page = await fetch.archived_page(url, TIMEOUT, as_of.replace("-", ""))
+        if not page:
+            raise ToolError(f"No readable Wayback Machine copy of {url} near {as_of} (or archive.org didn't "
+                            "answer; it is often slow, so retrying can help). page_history lists the copies.")
+        return f"(via {page.via})\n{fetch.window(page.text, start, max_chars)}"
     try:
         via, text = await _read_url(url, fresh=fresh, on_stage=on_stage)
     except ToolError:
@@ -531,7 +574,7 @@ async def fetch_page(
     except Exception as e:  # noqa: BLE001
         raise ToolError(f"Fetch failed for {url}\n{e}") from e
     if extract:
-        if not llm.llm_available():
+        if not (llm.llm_available() or llm.can_sample(ctx)):
             raise ToolError("extract needs an LLM and none is configured; use query= or read the page instead.")
         data = await llm.ask(f"From the page below, extract: {extract}\nReply with JSON only; use null for "
                              f"anything not on the page.\n\n{fetch.window(text, start, max_chars)}", max_tokens=4000)
@@ -539,7 +582,7 @@ async def fetch_page(
             raise ToolError("The LLM gave no answer (models down or quota exhausted). Read the page instead.")
         return f"(via {via}; extracted by LLM)\n{data}"
     if query:
-        return f"(via {via}; passages matching {query!r} out of {len(text)} chars)\n{_best_passages(text, query, max_chars)}"
+        return f"(via {via}; passages matching {query!r} out of {len(text)} chars)\n{await asyncio.to_thread(rerank.best_passages, text, query, max_chars)}"
     return f"(via {via})\n{fetch.window(text, start, max_chars)}"
 
 
@@ -560,7 +603,8 @@ async def fetch_pages(
         async with sem:
             try:
                 via, text = await asyncio.wait_for(_read_url(u, interactive=False), fetch.FETCH_DEADLINE)
-                body = _best_passages(text, query, max_chars) if query else fetch.window(text, 0, max_chars)
+                body = (await asyncio.to_thread(rerank.best_passages, text, query, max_chars) if query
+                        else fetch.window(text, 0, max_chars))
                 result = f"(via {via})\n{body}"
             except TimeoutError:
                 result = f"FAILED: no response within {fetch.FETCH_DEADLINE}s (try fetch_page on it alone)"
@@ -588,19 +632,6 @@ async def site_map(
         raise ToolError(f"Could not map {url}: {e}") from e
 
 
-@mcp.tool(title="Read Reddit", annotations=READ_ONLY, structured_output=False)
-async def reddit_fetch(
-    target: Annotated[str, Field(description="A post URL, or a subreddit: \"r/valheim\" or \"valheim\".")],
-    sort: Annotated[Literal["hot", "new", "top", "best"], Field(description="Order for a subreddit feed.")] = "hot",
-    num_results: Annotated[int, Field(description="Posts in a feed, or top comments on a post.", ge=1, le=100)] = 15,
-) -> str:
-    """Read a Reddit post with its body and top comments, or a subreddit's post list."""
-    try:
-        return await sources.reddit_fetch(target, sort=sort, limit=num_results)
-    except Exception as e:  # noqa: BLE001
-        raise ToolError(f"Reddit fetch failed: {e}") from e
-
-
 @mcp.tool(title="YouTube transcript", annotations=READ_ONLY, structured_output=False)
 async def youtube_transcript(
     url: Annotated[str, Field(description="YouTube video URL (watch, youtu.be, shorts or live).")],
@@ -617,24 +648,93 @@ async def youtube_transcript(
     return fetch.window(text, start, max_chars)
 
 
-@mcp.tool(title="Read X/Twitter, Bluesky, Telegram, Instagram", annotations=READ_ONLY, structured_output=False)
+@mcp.tool(title="Crawl a site", annotations=READ_ONLY, structured_output=False)
+async def crawl_site(
+    url: Annotated[str, Field(description='Where to start, e.g. "docs.astral.sh/uv". A path keeps the crawl inside it.')],
+    query: Annotated[str, Field(description="Follow links about this first, and return the matching passages of each page.")] = "",
+    num_pages: Annotated[int, Field(description="Most pages to read.", ge=1, le=100)] = 25,
+    max_depth: Annotated[int, Field(description="How many links away from the start page to go.", ge=1, le=5)] = 2,
+    path_filter: Annotated[str, Field(description='Only URLs containing this text, e.g. "/blog/".')] = "",
+    max_chars_each: Annotated[int, Field(description="Characters of text per page.", ge=200, le=10000)] = 1500,
+    ctx: Context | None = None,
+) -> str:
+    """Read a site by following its links (same site only), most relevant links first. Use it
+    when site_map finds no sitemap, or to gather a topic spread across many pages of one site."""
+    async def on_progress(done: int, total: int, page: str):
+        await _progress(ctx, done, total, page)
+    try:
+        return await crawl.crawl(url, query, num_pages, max_depth, path_filter, max_chars_each, on_progress)
+    except Exception as e:  # noqa: BLE001
+        raise ToolError(f"Could not crawl {url}: {e}") from e
+
+
+@mcp.tool(title="Page history (Wayback Machine)", annotations=READ_ONLY, structured_output=False)
+async def page_history(
+    url: Annotated[str, Field(description="The page whose archived copies you want.")],
+    num_results: Annotated[int, Field(description="Most snapshots to list.", ge=1, le=200)] = 20,
+    year_from: Annotated[int, Field(description="Only snapshots from this year on; 0 = any.", ge=0)] = 0,
+    year_to: Annotated[int, Field(description="Only snapshots up to this year; 0 = any.", ge=0)] = 0,
+) -> str:
+    """List a page's archived copies in the Wayback Machine, one per distinct version, with
+    dates and replay links. Read an old version with fetch_page(url, as_of="2019-06-01")."""
+    try:
+        return await wayback.snapshots(url, num_results, year_from or None, year_to or None)
+    except Exception as e:  # noqa: BLE001
+        raise ToolError(f"Wayback Machine lookup failed for {url} (archive.org is often slow; retry): {e}") from e
+
+
+@mcp.tool(title="Read Reddit, X/Twitter, Bluesky, Telegram, Instagram", annotations=READ_ONLY,
+          structured_output=False)
 async def social_fetch(
     target: Annotated[str, Field(description=(
-        'A post or profile URL (x.com, twitter.com, bsky.app, t.me, instagram.com), or a handle: '
-        '"@karpathy" is X, "@jay.bsky.team" is Bluesky.'))],
-    num_results: Annotated[int, Field(description="Recent posts for a profile, or replies for a Bluesky post.",
-                                      ge=1, le=50)] = 10,
+        'A post or profile URL (reddit.com, x.com, twitter.com, bsky.app, t.me, instagram.com), a subreddit '
+        '("r/valheim"), or a handle: "@karpathy" is X, "@jay.bsky.team" is Bluesky.'))],
+    num_results: Annotated[int, Field(description=(
+        "Recent posts for a profile or subreddit, or top comments/replies on a post."), ge=1, le=100)] = 10,
+    sort: Annotated[Literal["hot", "new", "top", "best"], Field(description="Order of a subreddit feed.")] = "hot",
 ) -> str:
-    """Read a public post, or a profile with its recent posts, without logging in. X via
-    fxtwitter (then X's embed API); Bluesky's public API; Telegram's channel preview;
-    Instagram's web API, which rate-limits often."""
+    """Read a public post with its comments, or a profile/subreddit with its recent posts, without
+    logging in. Reddit via its JSON API; X via fxtwitter (then X's embed API); Bluesky's public API;
+    Telegram's channel preview; Instagram's web API, which rate-limits often."""
+    if re.match(r"^/?r/\w+/?$", target.strip()) or sources.classify(target) == "reddit":
+        try:
+            return await sources.reddit_fetch(target.strip(), sort=sort, limit=num_results)
+        except Exception as e:  # noqa: BLE001
+            raise ToolError(f"Reddit fetch failed: {e}") from e
     try:
-        return await social.read(target, num_results)
+        return await social.read(target, min(num_results, 50))
     except ValueError as e:
         raise ToolError(str(e)) from e
     except Exception as e:  # noqa: BLE001
         raise ToolError(f"Could not read {target}: {e}. For Instagram, try again in a few minutes "
                         "or fetch_page on the URL.") from e
+
+
+@mcp.tool(title="Deep research report", annotations=READ_ONLY, structured_output=False)
+async def deep_research(
+    question: Annotated[str, Field(description="The question to research, in full, e.g. \"Is uv ready to replace poetry for "
+                                               "a team monorepo in 2026?\"")],
+    depth: Annotated[Literal["standard", "deep"], Field(description=(
+        "standard: 2 rounds, up to 8 sources (~4 min). deep: 4 rounds, up to 16 sources (~8 min)."))] = "standard",
+    ctx: Context | None = None,
+) -> str:
+    """Research a question over several rounds: plan sub-queries, search, read the best pages,
+    note what's still missing, search again, then write a report citing every claim as [n]
+    with a Sources list. Slow; for a quick answer use web_search(answer=True). Uses your own
+    model through MCP sampling when the client allows it, else the configured LLMs; with no
+    LLM at all it returns the best passages per source."""
+    async def search(q: str, n: int) -> list[dict]:
+        return (await _search(q, n, "fallback", None, None, "any", {}))[0]
+
+    async def read(url: str) -> str:
+        return (await _read_url(url, interactive=False))[1]
+
+    async def ask(prompt: str, max_tokens: int) -> str | None:
+        return await llm.ask(prompt, max_tokens, ctx=ctx)
+
+    async def progress(done: float, total: float, message: str) -> None:
+        await _progress(ctx, done, total, message)
+    return await research.deep_research(question, search, read, ask, progress, depth=depth)
 
 
 @mcp.tool(title="Find books, films, anime, games, music", annotations=READ_ONLY, structured_output=False)
@@ -657,6 +757,52 @@ async def media_search(
     return media.format_results(catalog, found, notes, num_results)
 
 
+@mcp.tool(title="Watch for a release", annotations=WRITES_FILES, structured_output=False)
+async def release_watch(
+    action: Annotated[Literal["add", "remove", "list", "check"], Field(description=(
+        "add/remove a title, list the watch list, or check every watch now."))],
+    query: Annotated[str, Field(description='Title for add/remove, e.g. "spider-man brand new day 2026".')] = "",
+    category: Annotated[Literal["movies", "tv", "anime"], Field(description="What kind of release.")] = "movies",
+    min_quality: Annotated[Literal[tuple(quality.TIERS)], Field(description=(
+        "Lowest acceptable quality; cinema recordings (CAM, TeleSync...) and suspicious files never count."))] = "WEB-DL",
+) -> str:
+    """Get a macOS notification when a title is released at a watchable quality (e.g. the WEB-DL
+    of a film now in cinemas). The shared HTTP server checks every 6 hours; "check" runs it now."""
+    if action in ("add", "remove") and not query.strip():
+        raise ToolError(f"{action} needs a query (the title to watch).")
+    if action == "add":
+        return watch.add(query.strip(), category, min_quality)
+    if action == "remove":
+        return watch.remove(query.strip())
+    if action == "list":
+        return watch.list_watches()
+    return "\n".join(await watch.check_all()) or "no watches"
+
+
+@mcp.tool(title="Watch a page for changes", annotations=WRITES_FILES, structured_output=False)
+async def page_watch(
+    action: Annotated[Literal["check", "forget", "list"], Field(description=(
+        "check: the first time, remember the page; after that, show what changed since last check. "
+        "forget: stop tracking the URL. list: tracked pages."))],
+    url: Annotated[str, Field(description="The page, e.g. a pricing, changelog or job listings page.")] = "",
+    query: Annotated[str, Field(description=(
+        'Only watch paragraphs mentioning these words, e.g. "price" or "python remote", so other '
+        "churn on the page (ads, dates) doesn't count as a change."))] = "",
+) -> str:
+    """Track a web page and see what changed since you last looked, as a diff of added and
+    removed lines."""
+    if action == "list":
+        return monitor.list_pages()
+    if not url.strip():
+        raise ToolError(f"{action} needs a url.")
+    if action == "forget":
+        return monitor.forget(url.strip())
+    try:
+        return await monitor.check(url.strip(), query)
+    except Exception as e:  # noqa: BLE001
+        raise ToolError(f"Could not check {url}: {e}") from e
+
+
 @mcp.tool(title="Download a book", annotations=WRITES_FILES, structured_output=False)
 async def book_download(
     md5: Annotated[str, Field(description="The 32-character md5 shown by media_search.",
@@ -666,27 +812,49 @@ async def book_download(
     """Download a book, comic or paper by md5 and save it with its original file name.
     Tries LibGen, then Z-Library (needs ZLIB_EMAIL/ZLIB_PASSWORD of a free account in .env)."""
     try:
-        return await media.book_download(md5.strip().lower(), save_dir)
+        return await media.book_download(md5.strip().lower(), str(_download_dir(save_dir)))
+    except ToolError:
+        raise
     except Exception as e:  # noqa: BLE001
         raise ToolError(f"Download failed for {md5}: {e}") from e
 
 
-@mcp.tool(title="Discover new sources", annotations=READ_ONLY, structured_output=False)
-async def discover_sources() -> str:
-    """Check two community-maintained lists for new or moved sites since the last check:
-    Prowlarr's ~550 torrent indexer definitions and FMHY's starred picks (books, audio, video,
-    games, torrents, AI...). Reports additions, removals and domain changes. The first run
-    records a baseline."""
+@mcp.tool(title="Download video or audio (YouTube and more)", annotations=WRITES_FILES, structured_output=False)
+async def media_download(
+    url: Annotated[str, Field(description=(
+        "A video, playlist or track page: YouTube, Vimeo, SoundCloud, Bandcamp, X, Instagram, TikTok, "
+        "Twitch, archive.org and ~1800 other sites yt-dlp supports."))],
+    format: Annotated[Literal["mp4", "mkv", "webm", "mp3", "m4a", "opus", "flac", "wav"], Field(description=(
+        "mp4/mkv/webm = video; mp3/m4a/opus/flac/wav = audio only. mp4 prefers H.264 so it plays everywhere."))] = "mp4",
+    max_height: Annotated[int, Field(description="Highest video resolution, e.g. 720, 1080, 2160. 0 = best available.",
+                                     ge=0, le=4320)] = 1080,
+    save_dir: Annotated[str, Field(description="Folder to save into.")] = "~/Downloads/media",
+    playlist: Annotated[bool, Field(description=(
+        f"If the URL is a playlist or channel, download its items (at most {download.MAX_PLAYLIST_ITEMS}). "
+        "Otherwise only the one video."))] = False,
+    subtitles: Annotated[bool, Field(description="Embed English subtitles (video formats only).")] = False,
+    ctx: Context | None = None,
+) -> str:
+    """Download a video or its audio with yt-dlp and ffmpeg, e.g. a YouTube video as mp4 or a
+    song as mp3. Skips files already saved. Returns the saved file paths and sizes."""
+    folder = _download_dir(save_dir)
+
+    async def on_progress(line: str):
+        await _progress(ctx, 0, None, line)
     try:
-        return await discover.discover()
+        return await download.download(url, format, max_height, folder, playlist, subtitles, on_progress)
     except Exception as e:  # noqa: BLE001
-        raise ToolError(f"Discovery failed: {e}") from e
+        raise ToolError(f"Download failed for {url}: {e}") from e
 
 
-@mcp.tool(title="Usage and mirror status", annotations=READ_ONLY, structured_output=False)
-def usage_status() -> str:
-    """This month's usage vs limits per search provider, LLM call counts, and which domain
-    currently works for each mirrored site."""
+@mcp.tool(title="Server status", annotations=READ_ONLY, structured_output=False)
+async def server_status(
+    check_new_sources: Annotated[bool, Field(description=(
+        "Also check Prowlarr's ~550 torrent indexer definitions and FMHY's starred picks for sites added, "
+        "removed or moved since the last check (the first check records a baseline)."))] = False,
+) -> str:
+    """This month's usage vs limits per search provider, LLM call counts, which domain currently
+    works for each mirrored site, and sources being skipped because they keep failing."""
     out = quota.status_table(CONFIG["search_providers"])
     llm_used = quota.llm_usage()
     if llm_used:
@@ -695,7 +863,42 @@ def usage_status() -> str:
     mirror_state = mirrors.status()
     if mirror_state:
         out += "\n\nMirrors (working domain first):\n" + mirror_state
+    failing = health.report()
+    if failing:
+        out += "\n\nSources skipped for now (failed repeatedly):\n" + "\n".join(f"  {f}" for f in failing)
+    if check_new_sources:
+        try:
+            out += "\n\n" + await discover.discover()
+        except Exception as e:  # noqa: BLE001
+            out += f"\n\nSource discovery failed: {e}"
     return out
+
+
+@mcp.prompt(title="Literature review")
+def literature_review(topic: str, years: str = "the last 5 years") -> str:
+    """Survey the research on a topic: key papers, methods, open problems."""
+    return (f"Write a literature review of {topic!r}, focused on {years}. Use paper_search (several phrasings), "
+            "knowledge_search with sites=['openreview', 'huggingface_papers'] for recent ML work, and paper_fetch "
+            "to read the 3-5 most cited or most relevant papers. Group the work by approach, say what each found, "
+            "note disagreements and open problems, and cite every claim with its paper and link.")
+
+
+@mcp.prompt(title="Company dossier")
+def company_dossier(company: str) -> str:
+    """Brief on a company: what it does, numbers, news, filings, people's opinions."""
+    return (f"Build a dossier on {company}. Use web_search for what it does and who runs it, live_data kind='stock' "
+            "for its quote if listed, news_search (recency='month') for recent events, SEC filings via live_data "
+            "if it's a US filer, and social_fetch / knowledge_search (hackernews) for what people say. Sections: "
+            "overview, numbers, recent news, risks, sentiment. Cite a URL for every fact and date the numbers.")
+
+
+@mcp.prompt(title="Compare options")
+def compare_options(options: str, criteria: str = "") -> str:
+    """Compare products, tools or choices side by side with sources."""
+    wanted = f" on: {criteria}" if criteria else " on the criteria that matter most for this kind of choice"
+    return (f"Compare {options}{wanted}. For each option run web_search with depth='advanced', and read Reddit "
+            "or Hacker News threads (social_fetch, knowledge_search) for real users' experience. Give a table, "
+            "then a recommendation with the reasons and the trade-offs. Cite sources and flag anything uncertain.")
 
 
 if __name__ == "__main__":
