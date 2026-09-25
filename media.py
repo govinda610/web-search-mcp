@@ -21,6 +21,7 @@ from pathlib import Path
 from urllib.parse import quote, urlparse
 
 from curl_cffi import AsyncSession
+from rapidfuzz import fuzz
 
 import fetch
 import health
@@ -388,6 +389,60 @@ async def limetorrents(query: str, limit: int, category: str = "") -> list[dict]
     return sorted(out, key=lambda x: -x["seeders"])[:limit]
 
 
+X1337_CATEGORY = {"movies": "Movies", "tv": "TV"}
+X1337_DETAILS = 6  # fetch the magnet from at most this many top-seeded rows
+
+
+async def _x1337_detail(base: str, path: str) -> str | None:
+    """The listing page carries no magnet, only a link to the torrent's own page."""
+    try:
+        page = await http(f"{base}{path}")
+    except Exception:  # noqa: BLE001 - best-effort; that one row just won't have a magnet
+        return None
+    m = re.search(r'magnet:\?xt=urn:btih:[^"\'<>\s]+', page.text)
+    return htmllib.unescape(m.group(0)) if m else None
+
+
+async def x1337(query: str, limit: int, category: str = "") -> list[dict]:
+    """1337x: a large general torrent index. Its main domains sit behind Cloudflare, so this
+    only works through the 1337xx.to mirror, and (per http()) usually needs Tor."""
+    cat = X1337_CATEGORY.get(category)
+    if not cat:
+        return []
+
+    async def attempt(base):
+        r = await http(f"{base}/category-search/{quote(query)}/{cat}/1/")
+        if "table-list" not in r.text:
+            raise RuntimeError("not a 1337x results page")
+        return base, r.text
+    base, page = await mirrors.call("1337x", ["https://1337xx.to", "https://1337x.to"],
+                                    {"prowlarr": "1337x"}, attempt)
+    rows = []
+    for tr in page[page.find("table-list"):].split("<tr")[1:]:
+        link = re.search(r'href="(/torrent/[^"]+)"[^>]*>([^<]+)<', tr)
+        if not link:
+            continue
+        size = re.search(r'coll-4[^"]*">\s*([\d.]+\s*[KMGT]i?B)', tr)
+        seeds = re.search(r'coll-2[^"]*">\s*(\d+)', tr)
+        rows.append({"path": link.group(1), "title": _text(link.group(2)),
+                    "size": (size.group(1) if size else "").replace("iB", "B"),
+                    "seeders": int(seeds.group(1)) if seeds else 0})
+    rows = sorted(rows, key=lambda x: -x["seeders"])[:X1337_DETAILS]
+    magnets = await asyncio.gather(*(_x1337_detail(base, r["path"]) for r in rows))
+    out = []
+    for row, magnet in zip(rows, magnets):
+        if not magnet:
+            continue
+        infohash = re.search(r"urn:btih:([a-zA-Z0-9]+)", magnet)
+        hexhash = _try_hex_hash(infohash.group(1)) if infohash else None
+        if not hexhash:
+            continue
+        out.append({"source": "1337x", "title": row["title"], "size": row["size"],
+                    "seeders": row["seeders"], "year": "", "magnet": magnet, "hash": hexhash,
+                    "url": f"{base}{row['path']}"})
+    return out[:limit]
+
+
 async def torrentio(query: str, limit: int, category: str = "") -> list[dict]:
     """Torrentio: a keyless aggregator over public trackers, keyed by IMDb id (movies.imdb_id).
     For TV it needs one specific episode, so it only runs when the query has "s01e02"."""
@@ -517,7 +572,8 @@ async def annas_archive(query: str, limit: int, category: str = "") -> list[dict
             raise RuntimeError("not an Anna's Archive results page")
         return base, text
     base, page = await mirrors.call("annas-archive", ["https://annas-archive.gl", "https://annas-archive.pk",
-                                                      "https://annas-archive.gd"], {"slum": "annas-archive"}, attempt)
+                                                      "https://annas-archive.gd"],
+                                    {"slum": "annas-archive", "annas_info": "annas-archive"}, attempt)
     starts = [m.start() for m in re.finditer(r'<a href="/md5/[0-9a-f]{32}" class="line-clamp-\[3\]', page)]
     out = []
     for i, start in enumerate(starts[:limit]):
@@ -792,8 +848,8 @@ SOURCES = {
     "comics": [libgen, getcomics, annas_archive, zlibrary],
     "manga": [anilist, mangaupdates, mangadex, weebcentral, nyaa, libgen],
     "anime": [anilist, subsplease, animetosho, nyaa, knaben],
-    "movies": [imdb, yts, knaben, piratebay, torrents_csv, limetorrents, torrentio, prowlarr, jackett],
-    "tv": [imdb, tvmaze, kuryana, eztv, kisskh, knaben, piratebay, torrents_csv, limetorrents, torrentio,
+    "movies": [imdb, yts, knaben, piratebay, torrents_csv, limetorrents, x1337, torrentio, prowlarr, jackett],
+    "tv": [imdb, tvmaze, kuryana, eztv, kisskh, knaben, piratebay, torrents_csv, limetorrents, x1337, torrentio,
           prowlarr, jackett],
     "subtitles": [opensubtitles],
     "audiobooks": [itunes, archive_org, audiobookbay],
@@ -801,7 +857,7 @@ SOURCES = {
     "podcasts": [itunes],
     "games": [fitgirl, archive_org],
     "software": [archive_org],
-    "torrents": [knaben, piratebay, torrents_csv, nyaa, limetorrents, prowlarr, jackett],
+    "torrents": [knaben, piratebay, torrents_csv, nyaa, limetorrents, x1337, prowlarr, jackett],
 }
 SOURCES["all"] = list(dict.fromkeys(f for fns in SOURCES.values() for f in fns))
 
@@ -828,14 +884,12 @@ async def _cached(fn, query: str, limit: int, category: str):
     return results
 
 
-async def search(query: str, category: str = "all", limit: int = 10,
-                 only: list[str] | None = None) -> tuple[list[dict], list[dict], list[str]]:
-    """Fan out to every source for the category in parallel, for at most SEARCH_DEADLINE seconds.
-    A source still running after that keeps running in the background (its result lands in the
-    cache for the next call) rather than being cancelled. A source failing twice in a row is
-    skipped for a while (health.py) instead of being retried every call.
-    Returns (catalog entries, downloadable results deduped by infohash/md5, per-source notes)."""
-    fns = [f for f in SOURCES.get(category, SOURCES["all"]) if not only or f.__name__ in only]
+async def _fan_out(fns: list, query: str, limit: int, category: str) -> tuple[list[tuple[bool, list]], list[str]]:
+    """Run every source in fns for one query, waiting up to SEARCH_DEADLINE. A source still
+    running after that keeps running in the background (its result lands in the cache for the
+    next call) rather than being cancelled. A source failing twice in a row is skipped for a
+    while (health.py) instead of being retried every call.
+    Returns each source's (is_catalog, results) plus a status note per source."""
     notes, tasks = [], {}
     for f in fns:
         wait = health.skipped(f.__name__)
@@ -862,9 +916,15 @@ async def search(query: str, category: str = "all", limit: int = 10,
             continue
         notes.append(f"{fn.__name__}: {len(res)}")
         lists.append((fn.__name__ in CATALOGS, res))
-    runtime = await movies.runtime_min(query, category) if category in ("movies", "tv") else None
-    # Take each source's best, then each one's second best, ... so every source is represented.
-    catalog, found, seen = [], [], set()
+    return lists, notes
+
+
+def _merge(lists: list[tuple[bool, list]], runtime: int | None, seen: set | None = None
+          ) -> tuple[list[dict], list[dict], set]:
+    """Take each source's best, then each one's second best, ... so every source is represented.
+    seen carries over across retry rounds so a re-run with a different query doesn't re-add
+    something the first round already found."""
+    catalog, found, seen = [], [], set() if seen is None else seen
     for rank in range(max((len(res) for _, res in lists), default=0)):
         for is_catalog, res in lists:
             if rank >= len(res):
@@ -879,7 +939,83 @@ async def search(query: str, category: str = "all", limit: int = 10,
                     r["quality_label"] = q["label"]
                     r["warnings"] = r.get("warnings", []) + q["warnings"]
                 (catalog if is_catalog else found).append(r)
-    return catalog, found, notes
+    return catalog, found, seen
+
+
+YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+
+
+async def _retry_queries(query: str, category: str) -> list[tuple[str, str]]:
+    """Retry candidates for a zero-result movies/tv search, tried in order until one hits:
+    the query with its year dropped, then a cheap alternate title (movies.alt_titles)."""
+    out = []
+    stripped = YEAR_RE.sub("", query).strip()
+    if stripped and stripped != query:
+        out.append(("year dropped", stripped))
+    for alt in await movies.alt_titles(query, category):
+        if alt.lower() != query.lower():
+            out.append(("alt title", alt))
+    return out[:3]
+
+
+def dedupe_similar(items: list[dict], threshold: int = 90) -> list[dict]:
+    """Collapse near-duplicate torrent results that _merge's exact hash/md5/url/title key
+    missed (same release re-hashed and re-uploaded under a slightly different name). Only
+    considers items with an infohash, bucketed by (year, season/episode, resolution) so
+    different episodes, seasons or resolutions never merge; within a bucket, titles normalized
+    and compared with rapidfuzz token_sort_ratio. Keeps the best-seeded copy and notes how many
+    sources carried it."""
+    other = [r for r in items if not r.get("hash")]
+    buckets: dict[tuple, list[dict]] = {}
+    for r in items:
+        if not r.get("hash"):
+            continue
+        ep = re.search(r"\bs\d{1,2}e\d{1,3}\b", r.get("title", ""), re.IGNORECASE)
+        buckets.setdefault((r.get("year", ""), ep.group(0).lower() if ep else "", r.get("resolution", "")),
+                          []).append(r)
+    kept = []
+    for group in buckets.values():
+        norm = [re.sub(r"\s+", " ", re.sub(r"[.\-_]+", " ", r["title"].lower())).strip() for r in group]
+        used = [False] * len(group)
+        for i, r in enumerate(group):
+            if used[i]:
+                continue
+            dupes = [r]
+            used[i] = True
+            for j in range(i + 1, len(group)):
+                if not used[j] and fuzz.token_sort_ratio(norm[i], norm[j]) >= threshold:
+                    dupes.append(group[j])
+                    used[j] = True
+            best = max(dupes, key=lambda x: x.get("seeders", 0))
+            if len(dupes) > 1:
+                others = sorted({d["source"] for d in dupes} - {best["source"]})
+                if others:
+                    best["info"] = " · ".join(x for x in (best.get("info", ""), f"also on {', '.join(others)}") if x)
+            kept.append(best)
+    return other + kept
+
+
+async def search(query: str, category: str = "all", limit: int = 10,
+                 only: list[str] | None = None) -> tuple[list[dict], list[dict], list[str]]:
+    """Fan out to every source for the category in parallel. If a movies/tv search comes back
+    with nothing downloadable, retry with the year dropped and then an alternate title before
+    giving up. Returns (catalog entries, downloadable results deduped, per-source notes)."""
+    fns = [f for f in SOURCES.get(category, SOURCES["all"]) if not only or f.__name__ in only]
+    lists, notes = await _fan_out(fns, query, limit, category)
+    runtime = await movies.runtime_min(query, category) if category in ("movies", "tv") else None
+    catalog, found, seen = _merge(lists, runtime)
+
+    if category in ("movies", "tv") and not found:
+        retry_fns = [f for f in fns if f.__name__ not in CATALOGS]
+        for why, retry_query in await _retry_queries(query, category):
+            retry_lists, _ = await _fan_out(retry_fns, retry_query, limit, category)
+            _, retry_found, seen = _merge(retry_lists, runtime, seen)
+            notes.append(f"retried as {why} ({retry_query!r}): {len(retry_found)} results")
+            if retry_found:
+                found = retry_found
+                break
+
+    return catalog, dedupe_similar(found), notes
 
 
 def format_results(catalog: list[dict], found: list[dict], notes: list[str], limit: int) -> str:

@@ -2,9 +2,10 @@
 
 Each site has seed domains. The domain that last worked is tried first; a failing one
 drops to the back. When every known domain fails, the list is refreshed (at most every
-6 hours) from a maintained source:
-  prowlarr: the Prowlarr indexer definition for the site (updated almost daily on GitHub)
-  slum:     open-slum.org, the shadow-library uptime monitor (Anna's Archive, LibGen, ...)
+6 hours) from whichever maintained sources the caller names:
+  prowlarr:   the Prowlarr indexer definition for the site (updated almost daily on GitHub)
+  slum:       open-slum.org, the shadow-library uptime monitor (Anna's Archive, LibGen, ...)
+  annas_info: annas-archive.info, a second uptime monitor for Anna's Archive's own domains
 A new domain is only kept if the site's own adapter parses real results from it, so
 parked domains and malware clones that merely answer HTTP 200 are rejected.
 """
@@ -20,6 +21,7 @@ STATE = STATE_DIR / "mirrors.json"
 REFRESH_AFTER = 6 * 3600
 PROWLARR = "https://raw.githubusercontent.com/Prowlarr/Indexers/master/definitions/v11/{}.yml"
 SLUM_PAGES = ("https://open-slum.org/", "https://open-slum.pages.dev/")
+ANNAS_INFO = "https://annas-archive.info/"
 
 
 class MirrorError(Exception):
@@ -68,12 +70,28 @@ async def _from_slum(keyword: str) -> list[str]:
     return ([u for u, s in matching if s == "up"] + [u for u, s in matching if s == "protected"])
 
 
+async def _from_annas_info(keyword: str) -> list[str]:
+    """Domains annas-archive.info reports up (green dot), up first."""
+    try:
+        html = await _get(ANNAS_INFO)
+    except Exception:  # noqa: BLE001 - just one seed among several; a miss here isn't fatal
+        return []
+    rows = re.findall(r'rounded-full flex-shrink-0 (bg-\w+-\d+)"></div>.*?'
+                      r'text-xs text-gray-500 truncate">\s*([^\s<][^<]*)', html, re.DOTALL)
+    up = [d.strip() for status, d in rows if status == "bg-green-500" and keyword in d]
+    down = [d.strip() for status, d in rows if status != "bg-green-500" and keyword in d]
+    return [f"https://{d}" for d in up + down]
+
+
 async def refresh(site: str, updates: dict) -> list[str]:
+    domains = []
     if "prowlarr" in updates:
-        return await _from_prowlarr(updates["prowlarr"])
+        domains += await _from_prowlarr(updates["prowlarr"])
     if "slum" in updates:
-        return await _from_slum(updates["slum"])
-    return []
+        domains += await _from_slum(updates["slum"])
+    if "annas_info" in updates:
+        domains += await _from_annas_info(updates["annas_info"])
+    return domains
 
 
 async def call(site: str, seeds: list[str], updates: dict, attempt):

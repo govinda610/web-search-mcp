@@ -93,6 +93,23 @@ async def runtime_min(query: str, category: str = "movies") -> int | None:
     return minutes
 
 
+async def alt_titles(query: str, category: str) -> list[str]:
+    """Cheap alternate-title candidates for media.py's zero-result retry ladder. TVmaze's free
+    `/akas` endpoint covers TV shows; movies have no equivalent free source, so the top IMDb
+    suggestion's own title stands in (often the canonical form of a loosely-typed query)."""
+    if category == "tv":
+        try:
+            show = (await media.http(f"https://api.tvmaze.com/singlesearch/shows?q={quote(query)}")).json()
+            akas = (await media.http(f"https://api.tvmaze.com/shows/{show['id']}/akas")).json()
+            return [a["name"] for a in akas][:5]
+        except Exception:  # noqa: BLE001 - no akas is not an error, just nothing to retry with
+            return []
+    hits = await _suggest(query)
+    wanted = QID_FOR_CATEGORY.get(category)
+    best = next((h for h in hits if h.get("qid") == wanted), None) or (hits[0] if hits else None)
+    return [best["l"]] if best and best["l"].lower() != query.lower() else []
+
+
 async def imdb(query: str, limit: int, category: str = "") -> list[dict]:
     """IMDb suggestions: what the title is. The top hit is enriched with runtime (Cinemeta) and
     streaming status (JustWatch); the rest just get title/year/cast, to keep this fast."""
