@@ -17,17 +17,19 @@ import socket
 import time
 from pathlib import Path
 from typing import NamedTuple
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import pymupdf
 import trafilatura
 from curl_cffi import AsyncSession
 
-CACHE = Path(__file__).parent / "state" / "cache"
+from store import STATE
+
+CACHE = STATE / "cache"
 # Cookies earned in the visible window (a check you clicked through, a login) are reused by
 # every later browser fetch, so you only solve a site's check once.
-COOKIES = Path(__file__).parent / "state" / "browser-cookies.json"
+COOKIES = STATE / "browser-cookies.json"
 HUMAN_WAIT = 120  # seconds the visible window waits for you to finish a manual check
 CACHE_TTL = 3600
 
@@ -53,6 +55,10 @@ VIA_TOR: set[str] = set()  # hosts that only answer through Tor, learned this se
 # drops the connection attempt, while a slow site times out mid-response ("Operation timed out").
 UNREACHABLE_CODES = (6, 7, 35, 56)
 FETCH_DEADLINE = 45  # seconds for one page in a batch (depth=advanced, fetch_pages)
+FETCH_TOTAL_DEADLINE = 90  # overall wall-clock budget for one fetch() call: every stage, direct + Tor retry
+MAX_REDIRECTS = 5  # hops followed by hand so each one can be SSRF-checked
+REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+BROWSER_SLOT_WAIT = 30  # seconds to wait for a free browser slot when no overall deadline applies
 
 
 def is_unreachable(e: Exception) -> bool:
@@ -87,6 +93,22 @@ def is_binary(content_type: str, body: bytes) -> bool:
     return content_type.startswith(("image/", "audio/", "video/")) or b"\0" in body[:2000]
 
 
+def _is_unsafe_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Anything that isn't a globally-routable address: RFC1918, loopback, link-local,
+    reserved, and CGNAT (100.64.0.0/10, e.g. Tailscale) all have is_global=False."""
+    return not ip.is_global
+
+
+def _check_ip(ip_str: str, hostname: str) -> None:
+    """Checks the address a request actually connected to (curl_cffi's Response.primary_ip),
+    not just the one check_url resolved beforehand. Catches DNS rebinding: a hostname that
+    resolves to a public IP when checked and a private one moments later when connected to."""
+    if not ip_str or os.environ.get("FETCH_ALLOW_PRIVATE") == "1":
+        return
+    if _is_unsafe_ip(ipaddress.ip_address(ip_str)):
+        raise FetchError(f"{hostname} resolved to a local/private address ({ip_str})")
+
+
 async def check_url(url: str) -> None:
     """Only public http(s) pages. Stops a prompt-injected page from steering the agent to local
     files (file://) or to services on this machine or network (SearXNG, the Chrome debug port)."""
@@ -101,7 +123,7 @@ async def check_url(url: str) -> None:
         return  # not resolvable here (an ISP DNS block); Tor resolves it remotely
     for info in infos:
         ip = ipaddress.ip_address(info[4][0].split("%")[0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        if _is_unsafe_ip(ip):
             raise FetchError(f"{parsed.hostname} is a local/private address; set FETCH_ALLOW_PRIVATE=1 to allow")
 
 
@@ -123,13 +145,70 @@ def to_text(url: str, content_type: str, body: bytes) -> str:
     return body.decode("utf-8", errors="replace")
 
 
-async def _curl_cffi(url: str, timeout: int, proxy: str | None = None):
-    async with AsyncSession() as s:
-        r = await s.get(url, impersonate="chrome", timeout=timeout, allow_redirects=True, proxy=proxy)
-    return r.status_code, r.headers.get("content-type", ""), r.content
+def _cap(timeout: int, deadline: float | None) -> int:
+    """A stage's own per-request timeout should never outlast what's left of the overall
+    fetch() budget."""
+    if deadline is None:
+        return timeout
+    return max(1, min(timeout, int(deadline - time.monotonic())))
 
 
-async def _camoufox(url: str, timeout: int, proxy: str | None = None, headless: bool = True):
+# without a browser fingerprint curl_cffi sends no User-Agent at all, which archive.org answers with 400
+PLAIN_UA = "web-search-mcp/1.0 (+https://github.com/govinda610/web-search-mcp)"
+
+
+async def _curl_cffi(url: str, timeout: int, proxy: str | None = None, deadline: float | None = None,
+                     impersonate: str | None = "chrome"):
+    """Follows redirects by hand (allow_redirects=False) so every hop is SSRF-checked before
+    it's requested, not just the URL the caller passed in."""
+    for _ in range(MAX_REDIRECTS + 1):
+        await check_url(url)
+        kwargs = {"impersonate": impersonate} if impersonate else {"headers": {"User-Agent": PLAIN_UA}}
+        async with AsyncSession() as s:
+            r = await s.get(url, timeout=_cap(timeout, deadline),
+                            allow_redirects=False, proxy=proxy, **kwargs)
+        _check_ip(r.primary_ip, urlparse(url).hostname or "")
+        location = r.headers.get("location")
+        if r.status_code in REDIRECT_STATUSES and location:
+            url = urljoin(url, location)
+            continue
+        return r.status_code, r.headers.get("content-type", ""), r.content
+    raise FetchError(f"too many redirects (>{MAX_REDIRECTS})")
+
+
+async def get_checked(url: str, timeout: int = 15, max_bytes: int = 8_000_000,
+                      impersonate: str | None = "chrome") -> tuple[str, str, bytes]:
+    """Plain GET with the same SSRF protections as fetch() -- redirects followed by hand, every
+    hop and the actually-connected IP checked -- plus a body-size cap. For callers (crawl.py)
+    that fetch arbitrary URLs directly without running the full stage chain.
+    impersonate=None sends a plain curl request with no browser fingerprint; some hosts (e.g.
+    archive.org) hang for the length of the timeout under curl_cffi's chrome/firefox/safari
+    TLS fingerprints, so wayback.py passes None.
+    Returns (final_url, content_type, body)."""
+    for _ in range(MAX_REDIRECTS + 1):
+        await check_url(url)
+        kwargs = {"impersonate": impersonate} if impersonate else {"headers": {"User-Agent": PLAIN_UA}}
+        async with AsyncSession() as s, s.stream("GET", url, timeout=timeout,
+                                                 allow_redirects=False, **kwargs) as r:
+            _check_ip(r.primary_ip, urlparse(url).hostname or "")
+            location = r.headers.get("location")
+            if r.status_code in REDIRECT_STATUSES and location:
+                url = urljoin(url, location)
+                continue
+            content_type = r.headers.get("content-type", "")
+            body = bytearray()
+            async for chunk in r.aiter_content():
+                body += chunk
+                if len(body) > max_bytes:
+                    if r.quit_now:  # tells curl to abort the transfer instead of finishing
+                        r.quit_now.set()  # the download into memory before we discard it
+                    break
+            return url, content_type, bytes(body)
+    raise FetchError(f"too many redirects (>{MAX_REDIRECTS})")
+
+
+async def _camoufox(url: str, timeout: int, proxy: str | None = None, headless: bool = True,
+                    deadline: float | None = None):
     from camoufox.async_api import AsyncCamoufox
 
     # The visible window uses the settings verified against DataDome (G2): real-location
@@ -137,48 +216,71 @@ async def _camoufox(url: str, timeout: int, proxy: str | None = None, headless: 
     options = {"os": "macos"} if headless else {"os": "macos", "humanize": True, "geoip": True}
     if proxy:  # Firefox takes socks5:// and resolves hostnames through the proxy itself
         options["proxy"] = {"server": proxy.replace("socks5h://", "socks5://")}
-    async with BROWSER_SLOTS, AsyncCamoufox(headless=headless, **options) as browser:
-        page = await browser.new_page(storage_state=COOKIES if COOKIES.exists() else None)
-        response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 2000)
-        # Automatic challenges clear within ~5s. A visible window also waits for you to click
-        # through a manual check (DDoS-Guard captcha, "I'm not a robot" box).
-        for _ in range(15 if headless else HUMAN_WAIT):
-            if not is_challenge((await page.content()).encode()):
-                break
-            await page.wait_for_timeout(1000)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=5000)
-        except Exception:  # noqa: BLE001 - pages with long-polling never go idle; content is fine
-            pass
-        body = (await page.content()).encode()
-        if not headless and not is_challenge(body):
-            COOKIES.parent.mkdir(parents=True, exist_ok=True)
-            await page.context.storage_state(path=COOKIES)
-            COOKIES.chmod(0o600)  # logged-in session cookies
+    slot_wait = max(1.0, deadline - time.monotonic()) if deadline is not None else BROWSER_SLOT_WAIT
+    try:
+        await asyncio.wait_for(BROWSER_SLOTS.acquire(), slot_wait)
+    except TimeoutError as e:
+        raise FetchError("no free browser slot (2 already busy)") from e
+    try:
+        async with AsyncCamoufox(headless=headless, **options) as browser:
+            page = await browser.new_page(storage_state=COOKIES if COOKIES.exists() else None)
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=_cap(timeout, deadline) * 2000)
+            await check_url(page.url)  # a redirect the browser followed could land on a private address
+            # Automatic challenges clear within ~5s. A visible window also waits for you to click
+            # through a manual check (DDoS-Guard captcha, "I'm not a robot" box), bounded by
+            # whatever's left of the overall fetch budget so it can't hold the browser slot forever.
+            loops = 15
+            if not headless:
+                loops = HUMAN_WAIT if deadline is None else max(1, min(HUMAN_WAIT, int(deadline - time.monotonic())))
+            for _ in range(loops):
+                if not is_challenge((await page.content()).encode()):
+                    break
+                await page.wait_for_timeout(1000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:  # noqa: BLE001 - pages with long-polling never go idle; content is fine
+                pass
+            body = (await page.content()).encode()
+            if not headless and not is_challenge(body):
+                COOKIES.parent.mkdir(parents=True, exist_ok=True)
+                await page.context.storage_state(path=COOKIES)
+                COOKIES.chmod(0o600)  # logged-in session cookies
+    finally:
+        BROWSER_SLOTS.release()
     # A solved challenge still reports its 403/503, so only a hard status (404, 410, ...) is kept;
     # otherwise report success and let fetch() judge the final content with is_challenge().
     status = response.status if response else 200
     return (status if status >= 400 and status not in RETRYABLE else 200), "text/html", body
 
 
-async def _jina(url: str, timeout: int, proxy: str | None = None):  # Jina fetches from its own servers
+_JINA_FAILURE = re.compile(
+    r"Warning: Target URL returned error [45]\d\d|^Title: Just a moment\.\.\.", re.MULTILINE)
+
+
+async def _jina(url: str, timeout: int, proxy: str | None = None,
+                deadline: float | None = None):  # Jina fetches from its own servers
     key = os.environ.get("JINA_API_KEY")
     if not key:
         raise FetchError("JINA_API_KEY not set")
-    async with httpx.AsyncClient(timeout=max(timeout, 30)) as c:
+    t = max(timeout, 30) if deadline is None else _cap(timeout, deadline)
+    async with httpx.AsyncClient(timeout=t) as c:
         r = await c.get(f"https://r.jina.ai/{url}", headers={"Authorization": f"Bearer {key}"})
+    text = r.content.decode("utf-8", errors="replace")
+    match = _JINA_FAILURE.search(text)
+    if match:
+        raise FetchError(f"jina: {match.group(0)}")
     return r.status_code, "text/markdown", r.content
 
 
-async def _camoufox_visible(url: str, timeout: int, proxy: str | None = None):
+async def _camoufox_visible(url: str, timeout: int, proxy: str | None = None, deadline: float | None = None):
     """DataDome catches headless browsers but not a real window, so a Firefox window opens
     briefly. Only reached when the headless browser was blocked. FETCH_VISIBLE_BROWSER=0 disables."""
     if os.environ.get("FETCH_VISIBLE_BROWSER", "1") == "0":
         raise FetchError("disabled (FETCH_VISIBLE_BROWSER=0)")
-    return await _camoufox(url, timeout, proxy, headless=False)
+    return await _camoufox(url, timeout, proxy, headless=False, deadline=deadline)
 
 
-async def _chrome_cdp(url: str, timeout: int, proxy: str | None = None):
+async def _chrome_cdp(url: str, timeout: int, proxy: str | None = None, deadline: float | None = None):
     """Open the page in a tab of your own running Chrome, with its logins and cookies, over the
     DevTools protocol. For sites that need an account (Instagram, X, LinkedIn) or reject Firefox.
     Opt-in: start Chrome with --remote-debugging-port=9222 and set CHROME_CDP_URL=http://127.0.0.1:9222."""
@@ -193,7 +295,8 @@ async def _chrome_cdp(url: str, timeout: int, proxy: str | None = None):
         browser = await p.chromium.connect_over_cdp(endpoint, timeout=5000)
         page = await browser.contexts[0].new_page()
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 2000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=_cap(timeout, deadline) * 2000)
+            await check_url(page.url)  # a redirect the tab followed could land on a private address
             try:
                 await page.wait_for_load_state("networkidle", timeout=5000)
             except Exception:  # noqa: BLE001, S110 - pages with long-polling never go idle; content is fine
@@ -209,37 +312,91 @@ STAGES = [("curl_cffi", _curl_cffi), ("camoufox", _camoufox), ("chrome_cdp", _ch
           ("camoufox_visible", _camoufox_visible), ("jina", _jina)]
 
 
-async def fetch(url: str, timeout: int = 15, interactive: bool = True, on_stage=None) -> Page:
-    """Run the stage chain; if the site is unreachable directly, run it again through Tor.
+async def fetch(url: str, timeout: int = 15, interactive: bool = True, on_stage=None,
+                deadline: float = FETCH_TOTAL_DEADLINE) -> Page:
+    """Run the stage chain; if the site is unreachable directly, run it again through Tor. If every
+    live stage fails (dead page, hard block), fall back to the closest Wayback Machine snapshot.
     interactive=False never opens a visible window (for batch reads nobody is watching).
-    on_stage(name) is awaited before each stage, for progress reporting."""
+    on_stage(name) is awaited before each stage, for progress reporting.
+    deadline is the wall-clock budget in seconds for the whole chain (direct + Tor retry); the
+    interactive visible-window stage only runs if enough of it remains."""
     await check_url(url)
     host = urlparse(url).hostname or ""
-    if host in VIA_TOR:
-        return await _escalate(url, timeout, TOR, interactive, on_stage)
+    end = time.monotonic() + deadline
     try:
-        return await _escalate(url, timeout, None, interactive, on_stage)
+        return await _live_fetch(url, timeout, interactive, on_stage, end, host)
+    except FetchError:
+        if on_stage:
+            await on_stage("wayback")
+        page = await archived_page(url, timeout)
+        if page:
+            return page
+        raise
+
+
+async def _live_fetch(url: str, timeout: int, interactive: bool, on_stage, end: float, host: str) -> Page:
+    if host in VIA_TOR:
+        return await _escalate(url, timeout, TOR, interactive, on_stage, end)
+    try:
+        return await _escalate(url, timeout, None, interactive, on_stage, end)
     except FetchError as direct:
         if not str(direct).startswith("unreachable"):
             raise
         try:
-            page = await _escalate(url, timeout, TOR, interactive, on_stage)
+            page = await _escalate(url, timeout, TOR, interactive, on_stage, end)
         except FetchError as tor:
             raise FetchError(f"{direct}; via Tor: {tor}") from tor
     VIA_TOR.add(host)
     return page._replace(via=page.via + "+tor")
 
 
-async def _escalate(url: str, timeout: int, proxy: str | None, interactive: bool = True, on_stage=None) -> Page:
+async def archived_page(url: str, timeout: int, timestamp: str = "") -> Page | None:
+    """The archived copy closest to timestamp (YYYY[MM[DD]], default now), fetched via the raw
+    `id_` replay form so the bytes are the original page, not archive.org's replay UI around it.
+    fetch() uses it as the last resort when every live stage failed."""
+    import wayback  # local import: wayback.py imports fetch, so this stays out of the module cycle
+
+    try:
+        replay = await wayback.closest(url, timestamp)
+    except Exception:  # noqa: BLE001 - archive.org being unreachable isn't fetch()'s error to raise
+        return None
+    match = replay and re.search(r"/web/(\d{4,14})", replay)
+    if not match:
+        return None
+    ts = match.group(1)
+    raw_url = f"https://web.archive.org/web/{ts}id_/{url}"
+    try:
+        status, content_type, body = await _curl_cffi(raw_url, timeout, impersonate=None)  # chrome fp hangs here
+    except Exception:  # noqa: BLE001 - a broken snapshot isn't better than no answer
+        return None
+    if status >= 400 or is_binary(content_type, body):
+        return None
+    text = await asyncio.to_thread(to_text, url, content_type, body)
+    if not text.strip():
+        return None
+    date = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}" if len(ts) >= 8 else ts
+    return Page(f"wayback (snapshot {date})", content_type, body, text)
+
+
+async def _escalate(url: str, timeout: int, proxy: str | None, interactive: bool = True, on_stage=None,
+                    deadline: float | None = None) -> Page:
     """Escalate through STAGES until one returns real content. Raises FetchError with every attempt."""
     attempts = []
     for name, stage in STAGES:
         if name == "camoufox_visible" and not interactive:
             continue
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                attempts.append(f"{name}: skipped (fetch budget ran out)")
+                break
+            if name == "camoufox_visible" and remaining < 10:
+                attempts.append(f"{name}: skipped (only {remaining:.0f}s left in fetch budget)")
+                continue
         if on_stage:
             await on_stage(name + (" via Tor" if proxy else ""))
         try:
-            status, content_type, body = await stage(url, timeout, proxy)
+            status, content_type, body = await stage(url, timeout, proxy, deadline=deadline)
         except Exception as e:  # noqa: BLE001 - any stage failure escalates to the next
             if name == "curl_cffi" and is_unreachable(e):
                 # a browser can't get past a cut connection either; skip straight to the Tor retry
@@ -271,26 +428,37 @@ def _cache_file(url: str) -> Path:
 
 def cache_get(url: str) -> str | None:
     f = _cache_file(url)
-    if f.exists() and time.time() - f.stat().st_mtime < CACHE_TTL:
-        return f.read_text()
+    try:
+        if time.time() - f.stat().st_mtime < CACHE_TTL:
+            return f.read_text()
+    except FileNotFoundError:
+        pass  # another call's cache_put pruned it, or it never existed
     return None
 
 
+CACHE_PRUNE_INTERVAL = 600  # seconds between sweeps for expired entries; not on every write
+_last_prune = 0.0
+
+
 def cache_put(url: str, text: str) -> None:
+    global _last_prune
     CACHE.mkdir(parents=True, exist_ok=True)
-    for old in CACHE.glob("*.txt"):  # drop expired entries so the cache doesn't grow forever
-        if time.time() - old.stat().st_mtime > CACHE_TTL:
-            old.unlink(missing_ok=True)
+    now = time.time()
+    if now - _last_prune > CACHE_PRUNE_INTERVAL:
+        for old in CACHE.glob("*.txt"):  # drop expired entries so the cache doesn't grow forever
+            if now - old.stat().st_mtime > CACHE_TTL:
+                old.unlink(missing_ok=True)
+        _last_prune = now
     _cache_file(url).write_text(text)
 
 
 async def fetch_text(url: str, timeout: int = 15, fresh: bool = False, interactive: bool = True,
-                     on_stage=None) -> tuple[str, str]:
+                     on_stage=None, deadline: float = FETCH_TOTAL_DEADLINE) -> tuple[str, str]:
     """(via, text), served from cache when fresh unless fresh=True."""
     cached = None if fresh else cache_get(url)
     if cached is not None:
         return "cache", cached
-    page = await fetch(url, timeout, interactive, on_stage)
+    page = await fetch(url, timeout, interactive, on_stage, deadline)
     cache_put(url, page.text)
     return page.via, page.text
 

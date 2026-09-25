@@ -5,7 +5,7 @@ import os
 import tempfile
 from pathlib import Path
 
-STATE = Path(__file__).parent / "state"
+STATE = Path(os.environ.get("WEB_MCP_STATE_DIR") or Path(__file__).parent / "state")  # tests point this elsewhere
 
 
 def load_json(path: Path) -> dict:
