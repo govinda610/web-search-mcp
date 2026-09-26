@@ -3,6 +3,7 @@ Run: uv run test_stack.py         (local providers only: SearXNG + DuckDuckGo, n
      uv run test_stack.py --paid  (also exercises Exa/Tavily/Firecrawl/Jina)
 Live network. LLM checks use the coding-plan models."""
 import asyncio
+import atexit
 import gzip
 import hashlib
 import ipaddress
@@ -23,6 +24,7 @@ _TEST_STATE = Path(tempfile.mkdtemp()) / "state"
 _REAL_STATE = Path(__file__).parent / "state"
 if _REAL_STATE.exists():
     shutil.copytree(_REAL_STATE, _TEST_STATE, ignore=shutil.ignore_patterns("cache"))
+atexit.register(shutil.rmtree, _TEST_STATE.parent, ignore_errors=True)  # the copy is ~270 MB (models/)
 os.environ["WEB_MCP_STATE_DIR"] = str(_TEST_STATE)
 import crawl  # noqa: E402
 import discover  # noqa: E402
