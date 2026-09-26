@@ -336,7 +336,7 @@ async function pollJobs() {
   const jobs = await (await fetch("/ui/api/jobs", { headers: H })).json();
   const hidden = store.get("hiddenJobs", []);
   $("downloads").innerHTML = jobs.filter(j => !hidden.includes(j.id)).slice(0, 5).map(j => `<div class="job">
-    <b>${j.status === "running" ? "⏳" : j.status === "done" ? "✓" : "✗"}</b> ${esc(j.label)}
+    <b>${j.status === "running" ? "⏳" : j.status === "done" ? "✓" : "✗"}</b> ${esc(j.label)} <span style="color:var(--dim)">→ ${esc(j.folder)}</span>
     <a href="#" data-hide="${j.id}" style="float:right">dismiss</a>
     <pre>${esc(j.status === "running" ? j.progress || "starting…" : j.result)}</pre></div>`).join("");
   clearTimeout(polling);

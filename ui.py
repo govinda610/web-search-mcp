@@ -205,6 +205,7 @@ def register(mcp, env: dict, fetch_page, media_download, book_download) -> None:
 def _start_download(body: dict, media_download, book_download) -> dict:
     """Downloads run in the background; the page polls /ui/api/jobs for progress."""
     job = {"id": next(_job_ids), "label": body.get("label") or body.get("url") or body.get("md5"),
+           "folder": "~/Downloads/books" if body.get("md5") else "~/Downloads/media",  # the tools' defaults
            "status": "running", "progress": "", "result": ""}
     _jobs[job["id"]] = job
 
