@@ -9,6 +9,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -853,7 +854,8 @@ async def usage_test():
 async def transport_stdio():
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
-    params = StdioServerParameters(command=sys.executable, args=["server.py"], cwd=os.getcwd())
+    params = StdioServerParameters(command=sys.executable, args=["server.py"], cwd=os.getcwd(),
+                                   env=dict(os.environ, MCP_TOOLS=""))  # all tools, whatever .env says
     async with stdio_client(params) as (rw, ww):
         async with ClientSession(rw, ww) as s:
             init = await s.initialize()
@@ -872,6 +874,17 @@ async def transport_stdio():
                res.content[0].text)
             res = await s.call_tool("media_search", {"query": "x", "category": "bogus"})
             ok("transport: bad choice rejected", res.is_error, res.content[0].text)
+    params = StdioServerParameters(command=sys.executable, args=["server.py"], cwd=os.getcwd(),
+                                   env=dict(os.environ, MCP_TOOLS="search,fetch_page"))
+    async with stdio_client(params) as (rw, ww):
+        async with ClientSession(rw, ww) as s:
+            init = await s.initialize()
+            names = sorted(t.name for t in (await s.list_tools()).tools)
+            ok("transport: MCP_TOOLS picks the tools", names == ["fetch_page", "knowledge_search", "news_search",
+                                                                  "server_status", "web_search"], str(names))
+            text = init.instructions + str([t.description for t in (await s.list_tools()).tools])
+            ok("transport: no mention of tools turned off", not re.search(r"\b(media_search|paper_search|fetch_pages)\b", text),
+               text[:200])
 
 
 async def transport_http():

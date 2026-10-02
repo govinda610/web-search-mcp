@@ -149,6 +149,30 @@ what went wrong; batch tools report each failed item inline instead. Slow tools 
 Three prompts are included: `literature_review(topic, years)`, `company_dossier(company)` and
 `compare_options(options, criteria)`.
 
+**Pick the tools.** Every tool's description costs context in every request, used or not. Set
+`MCP_TOOLS` to the groups or tool names you want; the guide and descriptions then stop mentioning
+the rest, and a prompt is dropped when a tool it needs is off. Empty means all.
+
+| Group | Tools |
+|---|---|
+| `search` | web_search, news_search, knowledge_search |
+| `read` | fetch_page, fetch_pages, site_map, crawl_site, page_history, page_watch |
+| `papers` | paper_search, paper_fetch |
+| `research` | deep_research |
+| `social` | social_fetch, youtube_transcript |
+| `live` | live_data |
+| `images` | image_search |
+| `media` | media_search, book_download, media_download, release_watch |
+
+| `MCP_TOOLS` | Tools | Context used |
+|---|---|---|
+| (empty) | 21 | ~6,800 tokens |
+| `search,read,papers,research` | 13 | ~4,300 |
+| `search,read` | 10 | ~3,400 |
+| `web_search,fetch_page` | 3 | ~1,500 |
+
+`server_status` is always on.
+
 **Safety.** Page content can contain prompt injections, so the fetch tools only open public
 `http(s)` URLs: `file://` and addresses on this machine or network (SearXNG, the Chrome debug
 port, your router) are refused. Set `FETCH_ALLOW_PRIVATE=1` to allow private addresses.

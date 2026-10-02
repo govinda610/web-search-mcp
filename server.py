@@ -57,22 +57,60 @@ CONFIG = json.loads((ROOT / "config.json").read_text())
 ENV = {k: os.environ.get(k, "") for k in [
     "SEARXNG_URL", "TAVILY_API_KEY", "EXA_API_KEY", "FIRECRAWL_API_KEY", "JINA_API_KEY"]}
 
+TOOL_GROUPS = {  # MCP_TOOLS picks from these; server_status is always on
+    "search": ["web_search", "news_search", "knowledge_search"],
+    "read": ["fetch_page", "fetch_pages", "site_map", "crawl_site", "page_history", "page_watch"],
+    "papers": ["paper_search", "paper_fetch"],
+    "research": ["deep_research"],
+    "social": ["social_fetch", "youtube_transcript"],
+    "live": ["live_data"],
+    "images": ["image_search"],
+    "media": ["media_search", "book_download", "media_download", "release_watch"],
+}
+ALL_TOOLS = {name for group in TOOL_GROUPS.values() for name in group} | {"server_status"}
+
+
+def _enabled_tools(spec: str) -> set[str]:
+    """MCP_TOOLS: comma-separated groups and/or tool names. Empty or "all" = every tool."""
+    wanted = {w.strip() for w in spec.split(",") if w.strip()}
+    if not wanted or "all" in wanted:
+        return ALL_TOOLS
+    unknown = wanted - ALL_TOOLS - set(TOOL_GROUPS)
+    if unknown:
+        raise SystemExit(f"MCP_TOOLS: unknown {', '.join(sorted(unknown))}. "
+                         f"Groups: {', '.join(TOOL_GROUPS)}, or tool names.")
+    return {name for w in wanted for name in TOOL_GROUPS.get(w, [w])} | {"server_status"}
+
+
+ENABLED = _enabled_tools(os.environ.get("MCP_TOOLS", ""))
+
+
+def _without_disabled(text: str) -> str:
+    """Drop the lines that point to a tool MCP_TOOLS turned off, so agents never hear of it."""
+    off = ALL_TOOLS - ENABLED
+    return "\n".join(line for line in text.splitlines()
+                     if not any(re.search(rf"\b{name}\b", line) for name in off))
+
+
 INSTRUCTIONS = """Local, keyless web research tools. Which to use:
-- a question or topic -> web_search (more_queries for several angles, depth="advanced" to read the top pages,
-  similar_to=<url> for pages like one you have)
+- a question or topic -> web_search (more_queries for several angles, depth="advanced" to read the top pages, similar_to=<url> for pages like one you have)
 - something that happened recently -> news_search (trends=True for coverage volume over time)
 - a broad question needing many sources and a cited report -> deep_research
-- facts, code, dev Q&A, ML models/papers, packages, trials, drugs, case law -> knowledge_search
-  (Wikipedia, HN, Stack Overflow, GitHub...; sites=["history"] searches pages already read, offline)
+- facts, code, dev Q&A, ML models/papers, packages, trials, drugs, case law -> knowledge_search (Wikipedia, HN, Stack Overflow, GitHub...; sites=["history"] searches pages already read, offline)
 - a stock price, exchange rate, crypto price, weather, economic indicator, places or SEC filings -> live_data
-- a specific URL -> fetch_page (several: fetch_pages; list a site's pages: site_map; read many: crawl_site);
-  paywalled pages fall back to archive.today / Wayback on their own
-- an old version of a page -> fetch_page with as_of, or page_history to list snapshots
+- a specific URL -> fetch_page (as_of= for an old version); paywalled pages fall back to archive.today / Wayback on their own
+- several URLs -> fetch_pages
+- list a site's pages -> site_map; read many pages of one site -> crawl_site
+- list the saved snapshots of a page -> page_history
 - tell me when a page changes -> page_watch
-- YouTube text -> youtube_transcript; Reddit, X/Twitter, Bluesky, Telegram, Instagram -> social_fetch
-- research papers -> paper_search, then paper_fetch to read one
-- a book, comic, manga, anime, film, show, game, audiobook, music, podcast or subtitles -> media_search;
-  book_download saves a book by md5; release_watch notifies when a good-quality release appears
+- YouTube text -> youtube_transcript
+- Reddit, X/Twitter, Bluesky, Telegram, Instagram -> social_fetch
+- research papers -> paper_search
+- read a paper found by paper_search -> paper_fetch
+- pictures -> image_search
+- a book, comic, manga, anime, film, show, game, audiobook, music, podcast or subtitles -> media_search
+- save a book found by media_search, by md5 -> book_download
+- tell me when a good-quality release appears -> release_watch
 - save a video or audio (YouTube and ~1800 sites) as mp4/mp3/..., or a magnet link's files -> media_download
 Long outputs are paged: pass start= as the output says. Failed calls return an error saying why."""
 
@@ -86,7 +124,7 @@ async def _watch_loop(_server):
         task.cancel()
 
 
-mcp = MCPServer("web-search", title="Web search & research", instructions=INSTRUCTIONS,
+mcp = MCPServer("web-search", title="Web search & research", instructions=_without_disabled(INSTRUCTIONS),
                 lifespan=_watch_loop if os.environ.get("MCP_TRANSPORT") == "http" else None)
 READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=True)
 WRITES_FILES = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True)
@@ -349,8 +387,9 @@ async def web_search(
     ctx: Context | None = None,
 ) -> str:
     """Search the web. Returns numbered results: title, URL, date (when known) and snippet.
-    For recent events use news_search; for papers paper_search; for books, films, anime, games
-    media_search."""
+    For recent events use news_search.
+    For papers use paper_search.
+    For books, films, anime and games use media_search."""
     queries = [query] + [q for q in (more_queries or []) if q.strip()][:9]
     if filetype:
         queries = [f"{q} filetype:{filetype.strip('. ').lower()}" for q in queries]
@@ -526,8 +565,8 @@ async def paper_search(
     """Search research papers across arXiv, Semantic Scholar, Google Scholar, PubMed, EuropePMC,
     OpenAIRE, Crossref and bioRxiv/medRxiv (plus CORE with CORE_API_KEY). Returns title,
     year, authors, venue, citations, DOI and PDF link.
-    Read one with paper_fetch. For ML conference papers with reviews, also try knowledge_search
-    with sites=["openreview"]."""
+    Read one with paper_fetch.
+    For ML conference papers with reviews, also try knowledge_search with sites=["openreview"]."""
     try:
         results = await papers.search(query, num_results, ENV["SEARXNG_URL"], TIMEOUT, year_from, year_to)
     except Exception as e:  # noqa: BLE001
@@ -773,9 +812,9 @@ async def deep_research(
 ) -> str:
     """Research a question over several rounds: plan sub-queries, search, read the best pages,
     note what's still missing, search again, then write a report citing every claim as [n]
-    with a Sources list. Slow; for a quick answer use web_search. Uses your own model through
-    MCP sampling when the client allows it, else the configured LLMs; with no LLM at all it
-    returns the best passages per source."""
+    with a Sources list. Uses your own model through MCP sampling when the client allows it,
+    else the configured LLMs; with no LLM at all it returns the best passages per source.
+    Slow; for a quick answer use web_search."""
     async def search(q: str, n: int) -> list[dict]:
         return (await _search(q, n, "fallback", None, None, "any", {}))[0]
 
@@ -974,8 +1013,18 @@ def _slim(schema: dict) -> dict:
     return schema
 
 
+PROMPT_TOOLS = {"literature_review": {"paper_search", "paper_fetch", "knowledge_search"},
+                "company_dossier": {"web_search", "live_data", "news_search", "social_fetch", "knowledge_search"},
+                "compare_options": {"web_search", "social_fetch", "knowledge_search"}}
+for _prompt, _needs in PROMPT_TOOLS.items():
+    if not _needs <= ENABLED:
+        mcp.remove_prompt(_prompt)
 for _tool in mcp._tool_manager.list_tools():  # the SDK has no public hook for this
+    if _tool.name not in ENABLED:
+        mcp.remove_tool(_tool.name)
+        continue
     _slim(_tool.parameters)
+    _tool.description = _without_disabled(_tool.description)
 
 ui.register(mcp, ENV, fetch_page, media_download, book_download)  # the search page at http://127.0.0.1:8765/
 
